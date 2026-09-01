@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Jetson 六色色块测试</title>
+  <style>
+    :root { color-scheme: light; font-family: sans-serif; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      background: #b8b8b8;
+      color: #111;
+    }
+    header, footer {
+      padding: 12px 18px;
+      background: #eeeeee;
+      text-align: center;
+    }
+    main { display: grid; place-items: center; padding: 24px; }
+    #patch {
+      width: min(42vmin, 440px);
+      aspect-ratio: 1;
+      border: 12px solid #f4f4f4;
+      box-shadow: 0 0 0 2px #777;
+      background: #ff0000;
+    }
+    #buttons { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+    button { min-width: 92px; padding: 8px 12px; font-size: 15px; }
+    #status { margin: 8px 0 0; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <header>
+    <div id="buttons"></div>
+    <div id="status"></div>
+  </header>
+  <main><div id="patch" aria-label="颜色测试块"></div></main>
+  <footer>保持浏览器缩放、显示器亮度和色块位置不变；按数字键 1～6 切换。</footer>
+  <script>
+    const colors = {
+      1: ["红", "#ff0000", "RGB(255,0,0)"],
+      2: ["黄", "#ffff00", "RGB(255,255,0)"],
+      3: ["蓝", "#0000ff", "RGB(0,0,255)"],
+      4: ["绿", "#00ff00", "RGB(0,255,0)"],
+      5: ["黑", "#000000", "RGB(0,0,0)"],
+      6: ["浅蓝", "#00b0f0", "RGB(0,176,240)"],
+    };
+    const patch = document.querySelector("#patch");
+    const status = document.querySelector("#status");
+    const buttons = document.querySelector("#buttons");
+    function select(id) {
+      const entry = colors[id];
+      patch.style.background = entry[1];
+      status.textContent = `目标 ${id} = ${entry[0]}，${entry[2]}，CSS ${entry[1]}`;
+    }
+    Object.entries(colors).forEach(([id, entry]) => {
+      const button = document.createElement("button");
+      button.textContent = `${id} ${entry[0]}`;
+      button.addEventListener("click", () => select(id));
+      buttons.appendChild(button);
+    });
+    document.addEventListener("keydown", event => {
+      if (colors[event.key]) select(event.key);
+    });
+    select("1");
+  </script>
+</body>
+</html>

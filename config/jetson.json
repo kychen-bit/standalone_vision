@@ -1,0 +1,332 @@
+{
+  "camera": {
+    "device": "/dev/v4l/by-id/usb-DECXIN_CAMERA_DECXIN_CAMERA_01.00.00-video-index0",
+    "backend": "gstreamer_nv",
+    "backend_fallback": "opencv_v4l2",
+    "backend_notice": "Jetson hardware MJPEG decode; use opencv_v4l2 only for comparison/troubleshooting",
+    "width": 1280,
+    "height": 720,
+    "fps": 60,
+    "fourcc": "MJPG",
+    "buffer_size": 1,
+    "threaded_capture": true,
+    "read_timeout_s": 0.25,
+    "strict_settings": false,
+    "profile_notice": "TEMPORARY SCREEN TEST SETUP - FINAL EXPOSURE/WHITE BALANCE REQUIRE REAL MATERIAL AND LIGHTING",
+    "v4l2_controls_strict": true,
+    "v4l2_control_profile": "camera_default_auto",
+    "v4l2_control_profiles": {
+      "camera_default_auto": {
+        "_replace_base": true,
+        "white_balance_automatic": 1,
+        "auto_exposure": 3,
+        "focus_automatic_continuous": 1,
+        "saturation": 60
+      },
+      "physical_4600k": {
+        "white_balance_temperature": 4600,
+        "exposure_time_absolute": 156,
+        "saturation": 60
+      },
+      "paper_day_locked": {
+        "_replace_base": true,
+        "white_balance_automatic": 0,
+        "auto_exposure": 1,
+        "focus_automatic_continuous": 0,
+        "white_balance_temperature": 4200,
+        "exposure_time_absolute": 80,
+        "focus_absolute": 414,
+        "saturation": 60,
+        "gain": 0,
+        "power_line_frequency": 1
+      }
+    },
+    "v4l2_controls": {
+      "white_balance_automatic": 0,
+      "auto_exposure": 1,
+      "focus_automatic_continuous": 0,
+      "brightness": 0,
+      "contrast": 0,
+      "saturation": 60,
+      "hue": 50,
+      "gamma": 100,
+      "gain": 0,
+      "power_line_frequency": 1,
+      "white_balance_temperature": 4600,
+      "sharpness": 2000,
+      "backlight_compensation": 0,
+      "exposure_time_absolute": 156,
+      "focus_absolute": 414,
+      "zoom_absolute": 0
+    },
+    "calibration_file": "config/calibration.json"
+  },
+  "serial": {
+    "enabled": false,
+    "device": "/dev/serial/by-id/REPLACE_WITH_RESULT_UART",
+    "baud": 115200
+  },
+  "coordinator": {
+    "maix_serial": "/dev/serial/by-id/REPLACE_WITH_MAIX_UART",
+    "mcu_serial": "/dev/serial/by-id/REPLACE_WITH_MCU_UART",
+    "baud": 115200,
+    "scene": "TURNTABLE",
+    "timeout_s": 20.0,
+    "max_attempts": 3,
+    "target_report_every": 0
+  },
+  "runtime": {
+    "enabled_modes": [
+      "COLOR",
+      "RING",
+      "STACK"
+    ],
+    "opencv_threads": 4,
+    "stable_frames": 5,
+    "stable_spread_px": 4.0,
+    "stable_spread_mm": 2.0,
+    "stable_yaw_deg": 0.8,
+    "min_confidence": 0.45,
+    "reset_after_misses": 2
+  },
+  "stability": {
+    "stable_frames": 3,
+    "max_center_delta_px": 6.0
+  },
+  "visualization": {
+    "draw_color_contours": false,
+    "draw_search_roi": true,
+    "show_fps": false,
+    "show_mask": false,
+    "show_hsv_probe": false
+  },
+  "pickup": {
+    "enabled": false,
+    "notice": "LEGACY MANUAL GATING ONLY - NOT USED BY DEFAULT COORDINATOR",
+    "capture_zone_px": null,
+    "capture_margin_px": 12,
+    "stable_frames": 5,
+    "stable_spread_px": 4.0,
+    "min_confidence": 0.45,
+    "reset_after_misses": 2,
+    "motion_window_frames": 5,
+    "max_target_speed_px_s": 30.0,
+    "low_speed_hold_frames": 3,
+    "final_recheck_frames": 3,
+    "ready_emit_every_frames": 3,
+    "result_valid_ms": 200,
+    "search_timeout_s": 20.0
+  },
+  "color_detection": {
+    "algorithm": "HSV_CONTOUR_V1",
+    "parameter_notice": "TEMPORARY SCREEN TEST PARAMETER - NEED RECALIBRATION WITH REAL MATERIAL",
+    "morphology": {
+      "kernel_size": 3,
+      "open_iterations": 1,
+      "close_iterations": 1
+    },
+    "geometry": {
+      "min_area": 300,
+      "max_area": 500000
+    },
+    "dynamic_roi": {
+      "enabled": true,
+      "margin_px": 80,
+      "activate_after": "STABLE",
+      "fallback": "FIXED_ROI_SAME_FRAME"
+    }
+  },
+  "colors": {
+    "1": {
+      "name": "RED",
+      "parameter_notice": "TEMPORARY SCREEN TEST PARAMETER - NEED RECALIBRATION WITH REAL MATERIAL",
+      "hsv_ranges": [
+        {"h_min": 0, "h_max": 10, "s_min": 100, "s_max": 255, "v_min": 60, "v_max": 255},
+        {"h_min": 170, "h_max": 179, "s_min": 100, "s_max": 255, "v_min": 60, "v_max": 255}
+      ]
+    },
+    "2": {
+      "name": "YELLOW",
+      "parameter_notice": "TEMPORARY SCREEN TEST PARAMETER - NEED RECALIBRATION WITH REAL MATERIAL",
+      "hsv_ranges": [
+        {"h_min": 20, "h_max": 40, "s_min": 100, "s_max": 255, "v_min": 70, "v_max": 255}
+      ]
+    },
+    "3": {
+      "name": "BLUE",
+      "parameter_notice": "TEMPORARY SCREEN TEST PARAMETER - NEED RECALIBRATION WITH REAL MATERIAL",
+      "hsv_ranges": [
+        {"h_min": 108, "h_max": 135, "s_min": 80, "s_max": 255, "v_min": 50, "v_max": 255}
+      ]
+    },
+    "4": {
+      "name": "GREEN",
+      "parameter_notice": "TEMPORARY SCREEN TEST PARAMETER - NEED RECALIBRATION WITH REAL MATERIAL",
+      "hsv_ranges": [
+        {"h_min": 45, "h_max": 85, "s_min": 80, "s_max": 255, "v_min": 40, "v_max": 255}
+      ]
+    },
+    "5": {
+      "name": "BLACK",
+      "parameter_notice": "TEMPORARY SCREEN TEST PARAMETER - NEED RECALIBRATION WITH REAL MATERIAL",
+      "black_threshold": {
+        "v_max": 80,
+        "s_min": 0,
+        "s_max": 255
+      }
+    },
+    "6": {
+      "name": "LIGHT_BLUE",
+      "parameter_notice": "TEMPORARY SCREEN TEST PARAMETER - NEED RECALIBRATION WITH REAL MATERIAL",
+      "hsv_ranges": [
+        {"h_min": 86, "h_max": 107, "s_min": 60, "s_max": 255, "v_min": 70, "v_max": 255}
+      ]
+    }
+  },
+  "ring_detection": {
+    "processing_scale": 0.75,
+    "blur_kernel_px": 7,
+    "clahe_clip_limit": 2.5,
+    "clahe_grid_size": 8,
+    "dp": 1.2,
+    "min_distance_px": 30,
+    "edge_threshold": 110,
+    "center_threshold": 22,
+    "min_radius_px": 18,
+    "max_radius_px": 110,
+    "expected_radius_px": 55
+  },
+  "turntable_detection": {
+    "processing_scale": 0.5,
+    "blur_kernel_px": 7,
+    "dp": 1.2,
+    "min_distance_px": 180,
+    "edge_threshold": 120,
+    "center_threshold": 30,
+    "min_radius_px": 150,
+    "max_radius_px": 290,
+    "expected_radius_px": 220
+  },
+  "scenes": {
+    "PAPER_TEST": {
+      "object_roi": {"x": 160, "y": 90, "width": 960, "height": 540},
+      "min_area": 300,
+      "max_area": 500000
+    },
+    "TURNTABLE": {
+      "turntable_roi": [
+        340,
+        70,
+        600,
+        600
+      ],
+      "object_roi": {"x": 340, "y": 70, "width": 600, "height": 600},
+      "min_area": 700,
+      "max_area": 50000
+    },
+    "ROUGH": {
+      "object_roi": {"x": 80, "y": 170, "width": 1120, "height": 430},
+      "ring_rois": {
+        "1": [
+          160,
+          250,
+          240,
+          240
+        ],
+        "2": [
+          520,
+          250,
+          240,
+          240
+        ],
+        "3": [
+          880,
+          250,
+          240,
+          240
+        ]
+      },
+      "station_reference_px": {
+        "1": [
+          280,
+          370
+        ],
+        "2": [
+          640,
+          370
+        ],
+        "3": [
+          1000,
+          370
+        ]
+      },
+      "station_reference_mm": {
+        "1": [
+          -180,
+          0
+        ],
+        "2": [
+          0,
+          0
+        ],
+        "3": [
+          180,
+          0
+        ]
+      },
+      "max_station_residual": 8.0
+    },
+    "STORAGE": {
+      "object_roi": {"x": 80, "y": 170, "width": 1120, "height": 430},
+      "ring_rois": {
+        "1": [
+          160,
+          250,
+          240,
+          240
+        ],
+        "2": [
+          520,
+          250,
+          240,
+          240
+        ],
+        "3": [
+          880,
+          250,
+          240,
+          240
+        ]
+      },
+      "station_reference_px": {
+        "1": [
+          280,
+          370
+        ],
+        "2": [
+          640,
+          370
+        ],
+        "3": [
+          1000,
+          370
+        ]
+      },
+      "station_reference_mm": {
+        "1": [
+          -180,
+          0
+        ],
+        "2": [
+          0,
+          0
+        ],
+        "3": [
+          180,
+          0
+        ]
+      },
+      "max_station_residual": 8.0
+    }
+  }
+}

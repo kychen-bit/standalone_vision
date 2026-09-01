@@ -1,0 +1,10 @@
+{
+  "camera_matrix": null,
+  "dist_coeffs": null,
+  "image_size": [1280, 720],
+  "planes": {
+    "TURNTABLE": {"calibrated": false, "homography_px_to_robot_mm": null, "rmse_mm": null},
+    "ROUGH": {"calibrated": false, "homography_px_to_robot_mm": null, "rmse_mm": null},
+    "STORAGE": {"calibrated": false, "homography_px_to_robot_mm": null, "rmse_mm": null}
+  }
+}
