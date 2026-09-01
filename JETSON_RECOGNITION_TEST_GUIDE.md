@@ -9,7 +9,7 @@ TEMPORARY SCREEN TEST PARAMETER
 NEED RECALIBRATION WITH REAL MATERIAL
 ```
 
-现在只确认以下事情：相机能取流、ROI 正确、六个 Mask 正确、轮廓和全局中心正确、三帧稳定、
+现在只确认以下事情：相机能取流、ROI 正确、六个 Mask 正确、轮廓和全局中心正确、五帧稳定、
 输出及串口协议没有断。不要为了屏幕效果添加 Lab、自动阈值或复杂分类器。
 
 ## 2. 当前处理流程
@@ -25,7 +25,7 @@ NEED RECALIBRATION WITH REAL MATERIAL
 → 选择面积最大的有效轮廓
 → cv2.moments 计算中心
 → 加回 ROI 左上角得到原图坐标
-→ 连续3帧颜色相同且相邻中心位移不超过阈值
+→ 连续5帧颜色相同且相邻中心位移不超过阈值
 → 稳定后使用“外接框+边距”动态ROI，失败时同帧回退固定ROI
 → LOST / UNSTABLE / STABLE
 ```
@@ -174,17 +174,17 @@ global_y = roi.y + local_y
 - 真目标太小被拒绝：降低 `min_area`；
 - 不调长宽比、圆度、实心度、多边形或 Hu 矩。
 
-### 4.4 三帧稳定
+### 4.4 五帧稳定
 
 ```json
 "stability": {
-  "stable_frames": 3,
+  "stable_frames": 5,
   "max_center_delta_px": 6.0
 }
 ```
 
-- 第一、二帧：`UNSTABLE`；
-- 连续三帧相邻中心位移均不超过 6 px：`STABLE`；
+- 第一至四帧：`UNSTABLE`；
+- 连续五帧相邻中心位移均不超过 6 px：`STABLE`；
 - 中心突然跳动：重新从一帧累计；
 - 目标消失：立即 `LOST`。
 
@@ -199,7 +199,7 @@ global_y = roi.y + local_y
 }
 ```
 
-- 前三帧和未识别状态只处理固定 ROI；
+- 前五帧和未识别状态只处理固定 ROI；
 - 达到 `STABLE` 后，下一帧处理上次目标外接框向四周扩展 80 px 的区域；
 - 目标触碰动态 ROI 边界或动态 ROI 未命中，会在同一帧重跑固定 ROI；
 - 调试画面蓝框是固定 ROI，浅蓝细框是动态 ROI；
@@ -221,7 +221,7 @@ global_y = roi.y + local_y
   "center_x": 550.0,
   "center_y": 350.0,
   "confidence": 1.0,
-  "stable_frames": 3
+  "stable_frames": 5
 }
 ```
 
@@ -365,8 +365,8 @@ v4l2-ctl -d /dev/video0 \
 - 黑色 Lab/L/V 局部亮度环；
 - 颜色原型自动标定。
 
-旧 `pickup` 速度/安全区/最终复检门控在配置中 `enabled=false`，协调器 `PICK` 已直接使用三帧
-COLOR 稳定结果，并继续发送原协议的 `GRASP_READY`。
+旧 `pickup` 速度/安全区/最终复检门控在配置中 `enabled=false`，协调器 `PICK` 使用五帧
+COLOR 稳定结果，并在 `GRASP_READY` 后等待电控 `EXEC` 确认。
 
 旧命令 `tools/calibrate_color_prototype.py` 只保留兼容提示，不再写配置。
 
@@ -383,3 +383,69 @@ python3 -m json.tool config/jetson.json >/dev/null
 python3 -m compileall -q jetson_recognition tools tests
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
+
+## 9. 圆环识别第一轮测试
+
+当前圆环流程为：工位搜索 ROI → 灰度 → 固定阈值二值化 → 轻量开/闭运算 → 轮廓 →
+面积/圆度/宽高比过滤 → 同心中心合并 → 动态裁剪中央数字 → 归一化模板匹配 →
+只选择请求的 `ring_id` → 配置帧数稳定。RING 主路径不使用 Hough、OCR或神经网络。
+
+`target 2` 现在表示“在所有圆环候选中寻找模板识别为2的圆环”，不再表示固定的中间 ROI。
+圆环可以出现在搜索 ROI 内的任意位置。当前内置 1/2/3 模板只用于屏幕流程验证，真实字体必须
+使用实际相机和印刷圆环重新采集。
+
+有桌面时依次测试目标编号，画面会显示橙色搜索 ROI、有效轮廓、每个圆环的
+`ID=<识别编号>`、模板分数 `S`、面积 `A` 和圆度 `C`：
+
+```bash
+python3 -m jetson_recognition.run live \
+  --mode RING --scene ROUGH --target 1 \
+  --show-roi --show-fps
+
+python3 -m jetson_recognition.run live \
+  --mode RING --scene ROUGH --target 2 \
+  --show-roi --show-fps
+
+python3 -m jetson_recognition.run live \
+  --mode RING --scene ROUGH --target 3 \
+  --show-roi --show-fps
+```
+
+需要观察最终二值图时额外加 `--show-mask`，只会多开一个 `Ring Mask` 窗口。SSH 下测性能：
+
+```bash
+python3 -m jetson_recognition.run live \
+  --mode RING --scene ROUGH --target 2 \
+  --headless --show-fps --stats-every 60
+```
+
+调参顺序：
+
+1. 先改 `scenes.ROUGH.ring_search_roi`，只覆盖机械臂当前可能看到的粗加工工位；
+2. 调 `ring_detection.threshold.value`，目标是圆环在 `Ring Mask` 中为连续白色、背景为黑色；
+   黑白相反时只切换 `invert`；
+3. 用调试画面的 `A` 调 `min_area/max_area`，只包住真实圆环轮廓；
+4. 轻微倾斜时适当放宽宽高比范围；只有完整圆环被拒绝时才小幅降低 `min_circularity`；
+5. 同一圆环的内外轮廓没有合并时再增大 `center_merge_distance_px`；
+6. 查看 `ID` 和 `S`；真实模板采集完成前不要通过降低 `min_score` 强行接受错误数字；
+7. 最后观察达到 `ring_detection.stability.stable_frames` 后能否进入 `STABLE`，再测试
+   `STORAGE` 场景。
+
+相机轻微倾斜只会使轮廓变成近似椭圆，当前宽高比范围可容忍一定透视变化。倾斜很大时应优先
+调整机械安装，让光轴尽量垂直于圆环平面，而不是继续放宽过滤参数。
+
+### 9.1 采集真实数字模板
+
+把实际圆环放进画面并运行：
+
+```bash
+python3 tools/capture_ring_digit_templates.py \
+  --scene ROUGH --camera /dev/video0
+```
+
+鼠标点击要采集的圆环，然后按它真实的数字 `1`、`2` 或 `3`；每个数字建议在正常观察高度、
+轻微左右倾斜下各保存 3～5 张。模板写入 `config/ring_templates/`。三个数字都有文件后，
+启动识别会显示 `template_source=FILES`；比赛前应把
+`digit_template.allow_builtin_fallback` 改为 `false`，避免缺少某个真实模板时退回屏幕测试字体。
+
+合成三圆与内置模板的开发机基线约为 4.6 ms/次，只用于代码回归，Jetson 和真实图片以实测为准。

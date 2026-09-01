@@ -207,12 +207,89 @@ def draw_color_debug(canvas, debug, draw_search_roi=True):
     return canvas
 
 
+def draw_circle_debug(canvas, debug, draw_search_roi=True):
+    if not debug:
+        return canvas
+    if draw_search_roi:
+        x, y, width, height = debug["roi"]
+        cv2.rectangle(
+            canvas, (x, y), (x + width, y + height), (255, 160, 0), 2
+        )
+    selected = debug.get("selected")
+    for candidate in debug.get("candidates", []):
+        center = tuple(int(round(value)) for value in candidate["center"])
+        is_selected = bool(candidate.get("selected", candidate is selected))
+        color = (0, 255, 0) if is_selected else (0, 220, 255)
+        thickness = 2 if is_selected else 1
+        if "contour" in candidate:
+            cv2.drawContours(
+                canvas, [candidate["contour"]], -1, color, thickness
+            )
+            x, y, width, height = candidate["bbox"]
+            cv2.rectangle(
+                canvas, (x, y), (x + width, y + height), color, thickness
+            )
+            label = "A=%.0f C=%.2f" % (
+                candidate["area"], candidate["circularity"]
+            )
+            label_position = (x, max(48, y - 5))
+        else:
+            radius = int(round(candidate["radius"]))
+            cv2.circle(canvas, center, radius, color, thickness)
+            label = "R=%.1f Q=%.2f" % (
+                candidate["radius"], candidate["quality"]
+            )
+            label_position = (
+                center[0] - radius,
+                max(48, center[1] - radius - 5),
+            )
+        if is_selected:
+            cv2.putText(
+                canvas,
+                label,
+                label_position,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+    for group in debug.get("groups", []):
+        center = tuple(int(round(value)) for value in group["center"])
+        is_selected = group is selected
+        color = (0, 255, 0) if is_selected else (0, 220, 255)
+        cv2.drawMarker(
+            canvas, center, color, cv2.MARKER_CROSS, 20, 2
+        )
+        bbox = group.get("digit_bbox")
+        if bbox:
+            x, y, width, height = bbox
+            cv2.rectangle(
+                canvas, (x, y), (x + width, y + height), color, 1
+            )
+        cv2.putText(
+            canvas,
+            "ID=%s S=%.2f" % (
+                group.get("ring_id", "UNKNOWN"),
+                float(group.get("digit_score", 0.0)),
+            ),
+            (center[0] - 45, center[1] + 72),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+    return canvas
+
+
 def draw_result(
     frame,
     measurement,
     state,
     count,
     color_debug=None,
+    circle_debug=None,
     performance=None,
     draw_search_roi=True,
 ):
@@ -243,6 +320,7 @@ def draw_result(
             color, cv2.MARKER_CROSS, 28, 2,
         )
     canvas = draw_color_debug(canvas, color_debug, draw_search_roi)
+    canvas = draw_circle_debug(canvas, circle_debug, draw_search_roi)
     if performance is not None:
         text += "  FPS=%.1f DET=%.2fms" % (
             performance.fps,
@@ -319,6 +397,11 @@ def run_image(arguments, config, engine, output):
         or visual["draw_search_roi"]
         or bool(arguments.save_mask)
     )
+    circle_image = arguments.mode.upper() in ("RING", "STATION", "TURNTABLE")
+    engine.detector.set_circle_debug(
+        circle_image
+        and (arguments.show or arguments.save or arguments.save_mask or visual["show_mask"])
+    )
     frame = cv2.imread(str(arguments.image))
     if frame is None:
         raise SystemExit("cannot read image: %s" % arguments.image)
@@ -336,14 +419,18 @@ def run_image(arguments, config, engine, output):
                 "SINGLE_FRAME",
                 int(measurement is not None),
                 engine.detector.last_color_debug,
+                engine.detector.last_circle_debug,
                 draw_search_roi=visual["draw_search_roi"],
             ),
         )
     debug = engine.detector.last_color_debug
     if arguments.save_mask:
-        if not debug or debug.get("mask") is None:
-            raise SystemExit("color mask is only available for COLOR/STACK")
-        cv2.imwrite(str(arguments.save_mask), debug["mask"])
+        debug_image = debug.get("mask") if debug else None
+        if debug_image is None and engine.detector.last_circle_debug:
+            debug_image = engine.detector.last_circle_debug.get("processed")
+        if debug_image is None:
+            raise SystemExit("no mask/preprocessed ROI is available for this mode")
+        cv2.imwrite(str(arguments.save_mask), debug_image)
     if arguments.show or visual["show_mask"]:
         if arguments.show:
             cv2.imshow(
@@ -354,11 +441,19 @@ def run_image(arguments, config, engine, output):
                     "SINGLE_FRAME",
                     int(measurement is not None),
                     debug,
+                    engine.detector.last_circle_debug,
                     draw_search_roi=visual["draw_search_roi"],
                 ),
             )
         if visual["show_mask"] and debug and debug.get("mask") is not None:
             cv2.imshow("Mask", debug["mask"])
+        elif visual["show_mask"] and engine.detector.last_circle_debug:
+            cv2.imshow(
+                "Ring Mask"
+                if engine.detector.last_circle_debug.get("kind") == "RING"
+                else "Preprocessed ROI",
+                engine.detector.last_circle_debug["processed"],
+            )
         cv2.waitKey(0)
         cv2.destroyAllWindows()
     return 0 if measurement is not None else 2
@@ -378,6 +473,13 @@ def run_live(arguments, config, engine, output):
         visual["draw_search_roi"] = True
     engine.detector.set_color_debug(
         color_gui or visual["show_mask"] or arguments.debug
+    )
+    circle_gui = (
+        arguments.mode.upper() in ("RING", "STATION", "TURNTABLE")
+        and not arguments.headless
+    )
+    engine.detector.set_circle_debug(
+        circle_gui or visual["show_mask"] or arguments.debug
     )
     camera_config = dict(config["camera"])
     if arguments.camera_profile:
@@ -469,6 +571,7 @@ def run_live(arguments, config, engine, output):
                     state,
                     count,
                     engine.detector.last_color_debug,
+                    engine.detector.last_circle_debug,
                     performance if visual["show_fps"] else None,
                     visual["draw_search_roi"],
                 )
@@ -478,6 +581,13 @@ def run_live(arguments, config, engine, output):
                 debug = engine.detector.last_color_debug
                 if visual["show_mask"] and debug and debug.get("mask") is not None:
                     cv2.imshow("Mask", debug["mask"])
+                elif visual["show_mask"] and engine.detector.last_circle_debug:
+                    cv2.imshow(
+                        "Ring Mask"
+                        if engine.detector.last_circle_debug.get("kind") == "RING"
+                        else "Preprocessed ROI",
+                        engine.detector.last_circle_debug["processed"],
+                    )
                 if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                     break
             if visual["show_fps"] and frame_number % max(1, arguments.stats_every) == 0:
@@ -499,6 +609,44 @@ def run_live(arguments, config, engine, output):
                             float(representative.get("quality", 0.0)), 3
                         ),
                     }
+                perf_details = {
+                    "roi_mode": color_runtime.get("mode"),
+                    "roi": color_runtime.get("roi"),
+                    "filter_stats": filter_stats,
+                    "candidate_count": int(
+                        filter_stats.get("accepted", len(debug_candidates))
+                    ),
+                    "largest_candidate": candidate_summary,
+                }
+                if arguments.mode.upper() == "RING":
+                    ring_debug = engine.detector.last_circle_debug or {}
+                    ring_candidates = ring_debug.get("candidates", [])
+                    largest_ring = (
+                        max(ring_candidates, key=lambda item: item["area"])
+                        if ring_candidates
+                        else None
+                    )
+                    perf_details = {
+                        "roi": ring_debug.get("roi"),
+                        "threshold": ring_debug.get("threshold"),
+                        "template_source": ring_debug.get("template_source"),
+                        "candidate_count": ring_debug.get("candidate_count", 0),
+                        "cluster_count": ring_debug.get("cluster_count", 0),
+                        "selected_cluster": ring_debug.get("selected"),
+                        "largest_candidate": (
+                            {
+                                "area": round(largest_ring["area"], 1),
+                                "circularity": round(
+                                    largest_ring["circularity"], 3
+                                ),
+                                "aspect_ratio": round(
+                                    largest_ring["aspect_ratio"], 3
+                                ),
+                            }
+                            if largest_ring is not None
+                            else None
+                        ),
+                    }
                 print(
                     json.dumps(
                         {
@@ -507,13 +655,7 @@ def run_live(arguments, config, engine, output):
                             "capture_fps": round(camera.capture_fps, 2),
                             "detect_ms": round(performance.detect_ms, 3),
                             "frames": frame_number,
-                            "roi_mode": color_runtime.get("mode"),
-                            "roi": color_runtime.get("roi"),
-                            "filter_stats": filter_stats,
-                            "candidate_count": int(
-                                filter_stats.get("accepted", len(debug_candidates))
-                            ),
-                            "largest_candidate": candidate_summary,
+                            **perf_details,
                         }
                     ),
                     flush=True,
@@ -528,7 +670,7 @@ def run_pickup(arguments, config, engine, output):
     pickup_config = dict(config.get("pickup", {}))
     if not pickup_config.get("enabled", False):
         raise SystemExit(
-            "legacy pickup gate is disabled; coordinator PICK uses simple 3-frame COLOR stability"
+            "legacy pickup gate is disabled; coordinator PICK uses configured COLOR stability"
         )
     if arguments.capture_zone is not None:
         pickup_config["capture_zone_px"] = list(arguments.capture_zone)
@@ -664,7 +806,7 @@ def parser():
         command.add_argument(
             "--show-mask",
             action="store_true",
-            help="show the active HSV mask in a second window",
+            help="show the HSV mask or preprocessed circle ROI in a second window",
         )
         command.add_argument(
             "--show-roi",

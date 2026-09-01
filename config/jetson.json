@@ -72,6 +72,10 @@
     "baud": 115200,
     "scene": "TURNTABLE",
     "timeout_s": 20.0,
+    "action_timeout_s": 30.0,
+    "result_valid_ms": 250,
+    "revoke_after_misses": 2,
+    "require_exec_ack": true,
     "max_attempts": 3,
     "target_report_every": 0
   },
@@ -90,7 +94,7 @@
     "reset_after_misses": 2
   },
   "stability": {
-    "stable_frames": 3,
+    "stable_frames": 5,
     "max_center_delta_px": 6.0
   },
   "visualization": {
@@ -184,21 +188,62 @@
     }
   },
   "ring_detection": {
-    "processing_scale": 0.75,
-    "blur_kernel_px": 7,
-    "clahe_clip_limit": 2.5,
-    "clahe_grid_size": 8,
-    "dp": 1.2,
-    "min_distance_px": 30,
-    "edge_threshold": 110,
-    "center_threshold": 22,
-    "min_radius_px": 18,
-    "max_radius_px": 110,
-    "expected_radius_px": 55
+    "algorithm": "DYNAMIC_DIGIT_TEMPLATE_RING_V1",
+    "parameter_notice": "TEMPORARY SCREEN TEST PARAMETERS AND BUILTIN DIGIT TEMPLATES - NEED RECALIBRATION WITH REAL RING",
+    "threshold": {
+      "mode": "fixed",
+      "value": 120,
+      "invert": true,
+      "adaptive_block_size": 31,
+      "adaptive_c": 5
+    },
+    "morphology": {
+      "kernel_size": 3,
+      "open_iterations": 0,
+      "close_iterations": 1
+    },
+    "contour": {
+      "min_area": 300,
+      "max_area": 30000,
+      "min_circularity": 0.55,
+      "min_aspect_ratio": 0.65,
+      "max_aspect_ratio": 1.35
+    },
+    "clustering": {
+      "center_merge_distance_px": 12,
+      "min_concentric_contours": 2
+    },
+    "stability": {
+      "stable_frames": 5,
+      "max_center_delta_px": 6.0,
+      "max_center_delta_mm": 2.0,
+      "min_confidence": 0.45,
+      "reset_after_misses": 2
+    },
+    "position_mapping": {
+      "enabled": false,
+      "axis": "x",
+      "ascending": true,
+      "ids": [1, 2, 3]
+    },
+    "digit_template": {
+      "enabled": true,
+      "template_directory": "config/ring_templates",
+      "allow_builtin_fallback": true,
+      "template_invert": true,
+      "image_invert": true,
+      "template_size": 64,
+      "padding_px": 5,
+      "crop_radius_ratio": 0.55,
+      "rotation_degrees": [-15, 0, 15],
+      "min_score": 0.45
+    }
   },
   "turntable_detection": {
     "processing_scale": 0.5,
     "blur_kernel_px": 7,
+    "clahe_clip_limit": 2.5,
+    "clahe_grid_size": 8,
     "dp": 1.2,
     "min_distance_px": 180,
     "edge_threshold": 120,
@@ -226,6 +271,7 @@
     },
     "ROUGH": {
       "object_roi": {"x": 80, "y": 170, "width": 1120, "height": 430},
+      "ring_search_roi": {"x": 80, "y": 170, "width": 1120, "height": 430},
       "ring_rois": {
         "1": [
           160,
@@ -278,6 +324,7 @@
     },
     "STORAGE": {
       "object_roi": {"x": 80, "y": 170, "width": 1120, "height": 430},
+      "ring_search_roi": {"x": 80, "y": 170, "width": 1120, "height": 430},
       "ring_rois": {
         "1": [
           160,

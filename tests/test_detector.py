@@ -21,6 +21,23 @@ def hsv_bgr(h, s=220, v=220):
     return tuple(int(value) for value in cv2.cvtColor(pixel, cv2.COLOR_HSV2BGR)[0, 0])
 
 
+def draw_numbered_ring(frame, center, digit, axes=(55, 55)):
+    cv2.ellipse(
+        frame, center, axes, 0, 0, 360, (20, 20, 20), 8, cv2.LINE_AA
+    )
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 1.5
+    thickness = 4
+    (width, height), _baseline = cv2.getTextSize(
+        str(digit), font, scale, thickness
+    )
+    origin = (center[0] - width // 2, center[1] + height // 2)
+    cv2.putText(
+        frame, str(digit), origin, font, scale,
+        (20, 20, 20), thickness, cv2.LINE_AA,
+    )
+
+
 class DetectorTests(unittest.TestCase):
     SCREEN_COLORS = {
         "1": hsv_bgr(0),
@@ -86,9 +103,10 @@ class DetectorTests(unittest.TestCase):
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         cv2.rectangle(frame, (300, 300), (400, 400), self.SCREEN_COLORS["1"], -1)
 
-        session.update(frame)
-        session.update(frame)
-        _measurement, stable, _count = session.update(frame)
+        required_frames = int(config["stability"]["stable_frames"])
+        stable = None
+        for _ in range(required_frames):
+            _measurement, stable, _count = session.update(frame)
         self.assertIsNotNone(stable)
         self.assertEqual(engine.detector.last_color_runtime["mode"], "FIXED_ROI")
 
@@ -167,6 +185,108 @@ class DetectorTests(unittest.TestCase):
         config = load_config()
         self.assertNotIn("color_classifier", config)
         self.assertEqual(config["color_detection"]["algorithm"], "HSV_CONTOUR_V1")
+
+    def test_ring_detection_selects_requested_digit_and_global_coordinates(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        frame = np.full((720, 1280, 3), 200, dtype=np.uint8)
+        for center_x, digit in ((280, "1"), (640, "2"), (1000, "3")):
+            draw_numbered_ring(frame, (center_x, 370), digit)
+
+        for ring_id, expected_x in (("1", 280), ("2", 640), ("3", 1000)):
+            with self.subTest(ring_id=ring_id):
+                result = detector.detect_ring(frame, ring_id, "ROUGH")
+                self.assertIsNotNone(result)
+                self.assertAlmostEqual(result.pixel_x, expected_x, delta=3.0)
+                self.assertAlmostEqual(result.pixel_y, 370.0, delta=3.0)
+
+    def test_ring_debug_exposes_mask_contours_and_selected_cluster(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        detector.set_circle_debug(True)
+        frame = np.full((720, 1280, 3), 200, dtype=np.uint8)
+        draw_numbered_ring(frame, (640, 370), "2")
+
+        result = detector.detect_ring(frame, "2", "ROUGH")
+        debug = detector.last_circle_debug
+
+        self.assertIsNotNone(result)
+        self.assertEqual(debug["roi"], [80, 170, 1120, 430])
+        self.assertEqual(debug["kind"], "RING")
+        self.assertEqual(debug["target_id"], "2")
+        self.assertEqual(debug["template_source"], "BUILTIN_SCREEN_TEST")
+        self.assertGreater(len(debug["candidates"]), 0)
+        self.assertIsNotNone(debug["selected"])
+        self.assertGreaterEqual(debug["selected"]["members"], 2)
+        self.assertAlmostEqual(debug["selected"]["center"][0], 640.0, delta=3.0)
+        self.assertAlmostEqual(debug["selected"]["center"][1], 370.0, delta=3.0)
+        self.assertTrue(
+            all("circularity" in candidate for candidate in debug["candidates"])
+        )
+        self.assertEqual(debug["processed"].ndim, 2)
+
+    def test_ring_session_uses_its_own_configured_stability(self):
+        config = load_config()
+        engine = build_engine(config)
+        session = engine.new_session("RING", ("2", "ROUGH"))
+        frame = np.full((720, 1280, 3), 200, dtype=np.uint8)
+        draw_numbered_ring(frame, (640, 370), "2")
+
+        required = int(config["ring_detection"]["stability"]["stable_frames"])
+        stable = None
+        for index in range(required):
+            _measurement, stable, count = session.update(frame)
+            if index < required - 1:
+                self.assertIsNone(stable)
+        self.assertIsNotNone(stable)
+        self.assertEqual(count, required)
+
+    def test_ring_contour_tolerates_moderate_camera_tilt(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        frame = np.full((720, 1280, 3), 200, dtype=np.uint8)
+        draw_numbered_ring(frame, (640, 370), "2", axes=(55, 42))
+
+        result = detector.detect_ring(frame, "2", "ROUGH")
+
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result.pixel_x, 640.0, delta=3.0)
+        self.assertAlmostEqual(result.pixel_y, 370.0, delta=3.0)
+
+    def test_ring_default_path_has_no_hough_parameters(self):
+        ring_config = load_config()["ring_detection"]
+        self.assertEqual(
+            ring_config["algorithm"], "DYNAMIC_DIGIT_TEMPLATE_RING_V1"
+        )
+        self.assertNotIn("center_threshold", ring_config)
+        self.assertNotIn("min_radius_px", ring_config)
+
+    def test_ring_identity_follows_digit_not_fixed_position(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        frame = np.full((720, 1280, 3), 200, dtype=np.uint8)
+        draw_numbered_ring(frame, (280, 370), "3")
+        draw_numbered_ring(frame, (640, 370), "1")
+        draw_numbered_ring(frame, (1000, 370), "2")
+
+        result = detector.detect_ring(frame, "2", "ROUGH")
+
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result.pixel_x, 1000.0, delta=3.0)
+
+    def test_ring_target_does_not_accept_a_different_digit(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        frame = np.full((720, 1280, 3), 200, dtype=np.uint8)
+        draw_numbered_ring(frame, (730, 420), "1")
+
+        self.assertIsNone(detector.detect_ring(frame, "2", "ROUGH"))
+
+    def test_single_target_ring_can_move_inside_search_roi(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        for center in ((220, 260), (730, 420), (1080, 520)):
+            frame = np.full((720, 1280, 3), 200, dtype=np.uint8)
+            draw_numbered_ring(frame, center, "2")
+            with self.subTest(center=center):
+                result = detector.detect_ring(frame, "2", "ROUGH")
+                self.assertIsNotNone(result)
+                self.assertAlmostEqual(result.pixel_x, center[0], delta=3.0)
+                self.assertAlmostEqual(result.pixel_y, center[1], delta=3.0)
 
 
 if __name__ == "__main__":

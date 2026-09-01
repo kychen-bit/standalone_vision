@@ -99,17 +99,47 @@ class RecognitionSession:
             return measurement, stable, len(self.window.samples)
         if self.window is None or self.unit != measurement.unit:
             self.unit = measurement.unit
-            spread = (
-                runtime["stable_spread_mm"]
-                if self.unit == "MM"
-                else runtime["stable_spread_px"]
-            )
+            if self.mode == "RING":
+                detector_config = getattr(self.engine.detector, "config", {})
+                stability = detector_config.get("ring_detection", {}).get(
+                    "stability", {}
+                )
+                spread = float(
+                    stability.get(
+                        "max_center_delta_mm"
+                        if self.unit == "MM"
+                        else "max_center_delta_px",
+                        runtime["stable_spread_mm"]
+                        if self.unit == "MM"
+                        else runtime["stable_spread_px"],
+                    )
+                )
+                required_frames = int(
+                    stability.get("stable_frames", runtime["stable_frames"])
+                )
+                minimum_quality = float(
+                    stability.get("min_confidence", runtime["min_confidence"])
+                )
+                reset_after_misses = int(
+                    stability.get(
+                        "reset_after_misses", runtime["reset_after_misses"]
+                    )
+                )
+            else:
+                spread = (
+                    runtime["stable_spread_mm"]
+                    if self.unit == "MM"
+                    else runtime["stable_spread_px"]
+                )
+                required_frames = runtime["stable_frames"]
+                minimum_quality = runtime["min_confidence"]
+                reset_after_misses = runtime["reset_after_misses"]
             self.window = StableWindow(
-                required_frames=runtime["stable_frames"],
+                required_frames=required_frames,
                 max_spread_xy=spread,
                 max_spread_yaw=runtime["stable_yaw_deg"],
-                min_quality=runtime["min_confidence"],
-                reset_after_misses=runtime["reset_after_misses"],
+                min_quality=minimum_quality,
+                reset_after_misses=reset_after_misses,
             )
         stable = self.window.update(
             measurement.kind + ":" + measurement.target_id,

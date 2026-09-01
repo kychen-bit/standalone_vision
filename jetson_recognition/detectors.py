@@ -53,6 +53,7 @@ class TopViewDetector:
 
     def __init__(self, config, project_root):
         self.config = config
+        self.project_root = project_root
         calibration_path = project_root / config["camera"].get(
             "calibration_file", "config/calibration.json"
         )
@@ -121,11 +122,34 @@ class TopViewDetector:
         self._last_color_filter_stats = None
 
         ring_config = config["ring_detection"]
-        grid_size = max(1, int(ring_config.get("clahe_grid_size", 8)))
+        ring_morphology = ring_config["morphology"]
+        ring_kernel_size = self._odd_kernel(
+            ring_morphology.get("kernel_size", 3), "ring morphology"
+        )
+        self.ring_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (ring_kernel_size, ring_kernel_size)
+        )
+        self.ring_open_iterations = max(
+            0, int(ring_morphology.get("open_iterations", 0))
+        )
+        self.ring_close_iterations = max(
+            0, int(ring_morphology.get("close_iterations", 1))
+        )
+        self.ring_digit_config = dict(ring_config.get("digit_template", {}))
+        self.ring_digit_templates = {}
+        self.ring_template_source = "DISABLED"
+        if self.ring_digit_config.get("enabled", False):
+            self._load_ring_digit_templates()
+
+        # Hough remains available only for the independent turntable detector.
+        turntable_config = config["turntable_detection"]
+        grid_size = max(1, int(turntable_config.get("clahe_grid_size", 8)))
         self.circle_clahe = cv2.createCLAHE(
-            clipLimit=float(ring_config.get("clahe_clip_limit", 2.5)),
+            clipLimit=float(turntable_config.get("clahe_clip_limit", 2.5)),
             tileGridSize=(grid_size, grid_size),
         )
+        self.circle_debug_enabled = False
+        self.last_circle_debug = None
         self._validate_rois()
 
     def set_color_debug(self, enabled):
@@ -133,12 +157,166 @@ class TopViewDetector:
         if not self.color_debug_enabled:
             self.last_color_debug = None
 
+    def set_circle_debug(self, enabled):
+        """Keep circle candidates and the processed ROI for live tuning."""
+        self.circle_debug_enabled = bool(enabled)
+        if not self.circle_debug_enabled:
+            self.last_circle_debug = None
+
     @staticmethod
     def _odd_kernel(value, label):
         value = int(value)
         if value < 1 or value % 2 == 0:
             raise ValueError("%s kernel must be a positive odd integer" % label)
         return value
+
+    @staticmethod
+    def _foreground_mask(gray, invert=True):
+        threshold_type = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+        _value, mask = cv2.threshold(
+            gray, 0, 255, threshold_type | cv2.THRESH_OTSU
+        )
+        return mask
+
+    @staticmethod
+    def _normalize_digit(mask, size, padding):
+        contours, _hierarchy = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        height, width = mask.shape[:2]
+        minimum_area = max(2.0, float(height * width) * 0.003)
+        usable = []
+        fallback = []
+        for contour in contours:
+            if cv2.contourArea(contour) < minimum_area:
+                continue
+            x, y, box_width, box_height = cv2.boundingRect(contour)
+            fallback.append((x, y, box_width, box_height))
+            if (
+                x > 0
+                and y > 0
+                and x + box_width < width - 1
+                and y + box_height < height - 1
+            ):
+                usable.append((x, y, box_width, box_height))
+        boxes = usable or fallback
+        if not boxes:
+            return None
+        left = min(box[0] for box in boxes)
+        top = min(box[1] for box in boxes)
+        right = max(box[0] + box[2] for box in boxes)
+        bottom = max(box[1] + box[3] for box in boxes)
+        digit = mask[top:bottom, left:right]
+        if digit.size == 0:
+            return None
+        available = max(1, int(size) - 2 * int(padding))
+        scale = min(
+            float(available) / max(digit.shape[1], 1),
+            float(available) / max(digit.shape[0], 1),
+        )
+        resized_width = max(1, int(round(digit.shape[1] * scale)))
+        resized_height = max(1, int(round(digit.shape[0] * scale)))
+        resized = cv2.resize(
+            digit,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        normalized = np.zeros((int(size), int(size)), dtype=np.uint8)
+        offset_x = (int(size) - resized_width) // 2
+        offset_y = (int(size) - resized_height) // 2
+        normalized[
+            offset_y : offset_y + resized_height,
+            offset_x : offset_x + resized_width,
+        ] = resized
+        return normalized
+
+    @staticmethod
+    def _rotate_binary(image, angle):
+        if abs(float(angle)) < 1e-6:
+            return image
+        size = image.shape[0]
+        matrix = cv2.getRotationMatrix2D(
+            ((size - 1) / 2.0, (size - 1) / 2.0), float(angle), 1.0
+        )
+        return cv2.warpAffine(
+            image,
+            matrix,
+            (size, size),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+    def _builtin_digit_template(self, digit, size, padding):
+        canvas = np.zeros((128, 128), dtype=np.uint8)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 3.2
+        thickness = 7
+        (text_width, text_height), _baseline = cv2.getTextSize(
+            str(digit), font, font_scale, thickness
+        )
+        origin = (
+            (canvas.shape[1] - text_width) // 2,
+            (canvas.shape[0] + text_height) // 2,
+        )
+        cv2.putText(
+            canvas,
+            str(digit),
+            origin,
+            font,
+            font_scale,
+            255,
+            thickness,
+            cv2.LINE_AA,
+        )
+        return self._normalize_digit(canvas, size, padding)
+
+    def _load_ring_digit_templates(self):
+        config = self.ring_digit_config
+        size = max(24, int(config.get("template_size", 64)))
+        padding = max(1, int(config.get("padding_px", 5)))
+        angles = [float(value) for value in config.get("rotation_degrees", [0])]
+        template_directory = self.project_root / config.get(
+            "template_directory", "config/ring_templates"
+        )
+        loaded_digits = set()
+        for digit in ("1", "2", "3"):
+            base_templates = []
+            if template_directory.exists():
+                for path in sorted(template_directory.glob("%s*" % digit)):
+                    gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+                    if gray is None:
+                        continue
+                    mask = self._foreground_mask(
+                        gray, bool(config.get("template_invert", True))
+                    )
+                    if int(np.count_nonzero(mask)) > mask.size // 2:
+                        mask = cv2.bitwise_not(mask)
+                    normalized = self._normalize_digit(mask, size, padding)
+                    if normalized is not None:
+                        base_templates.append(normalized)
+                        loaded_digits.add(digit)
+            if not base_templates and config.get("allow_builtin_fallback", True):
+                base_templates.append(
+                    self._builtin_digit_template(digit, size, padding)
+                )
+            variants = []
+            for template in base_templates:
+                for angle in angles:
+                    variants.append(self._rotate_binary(template, angle))
+            if variants:
+                self.ring_digit_templates[digit] = variants
+        if set(self.ring_digit_templates) != {"1", "2", "3"}:
+            raise ValueError(
+                "ring digit templates 1/2/3 are incomplete in %s"
+                % template_directory
+            )
+        if loaded_digits == {"1", "2", "3"}:
+            self.ring_template_source = "FILES"
+        elif loaded_digits:
+            self.ring_template_source = "MIXED_FILES_AND_BUILTIN"
+        else:
+            self.ring_template_source = "BUILTIN_SCREEN_TEST"
 
     def _validate_rois(self):
         width = int(self.config["camera"]["width"])
@@ -149,6 +327,8 @@ class TopViewDetector:
                 rectangles.append(("object_roi", scene["object_roi"]))
             if "turntable_roi" in scene:
                 rectangles.append(("turntable_roi", scene["turntable_roi"]))
+            if "ring_search_roi" in scene:
+                rectangles.append(("ring_search_roi", scene["ring_search_roi"]))
             for ring_id, rectangle in scene.get("ring_rois", {}).items():
                 rectangles.append(("ring_rois.%s" % ring_id, rectangle))
             for name, rectangle in rectangles:
@@ -395,7 +575,16 @@ class TopViewDetector:
             minRadius=max(1, int(round(parameters["min_radius_px"] * scale))),
             maxRadius=max(2, int(round(parameters["max_radius_px"] * scale))),
         )
+        debug = None
+        if self.circle_debug_enabled:
+            debug = {
+                "roi": _roi_values(roi_rect),
+                "processed": gray,
+                "candidates": [],
+                "selected": None,
+            }
         if circles is None:
+            self.last_circle_debug = debug
             return None
         expected = float(parameters.get("expected_radius_px", 0))
         candidates = []
@@ -416,27 +605,309 @@ class TopViewDetector:
             )
             border_score = max(0.0, min(1.0, border / max(float(radius), 1.0)))
             quality = 0.7 * radius_score + 0.3 * border_score
-            candidates.append((quality, float(center_x), float(center_y), float(radius)))
-        quality, center_x, center_y, radius = max(candidates, key=lambda item: item[0])
+            candidate = (quality, float(center_x), float(center_y), float(radius))
+            candidates.append(candidate)
+            if debug is not None:
+                debug["candidates"].append(
+                    {
+                        "center": [center_x + offset_x, center_y + offset_y],
+                        "radius": radius,
+                        "quality": quality,
+                    }
+                )
+        selected = max(candidates, key=lambda item: item[0])
+        quality, center_x, center_y, radius = selected
+        if debug is not None:
+            selected_index = candidates.index(selected)
+            debug["selected"] = debug["candidates"][selected_index]
+            self.last_circle_debug = debug
         return center_x + offset_x, center_y + offset_y, radius, quality
+
+    def _make_ring_mask(self, gray, threshold_config):
+        mode = str(threshold_config.get("mode", "fixed")).lower()
+        threshold_type = (
+            cv2.THRESH_BINARY_INV
+            if bool(threshold_config.get("invert", True))
+            else cv2.THRESH_BINARY
+        )
+        if mode == "fixed":
+            _value, mask = cv2.threshold(
+                gray,
+                int(threshold_config.get("value", 120)),
+                255,
+                threshold_type,
+            )
+            return mask
+        if mode == "adaptive":
+            block_size = self._odd_kernel(
+                threshold_config.get("adaptive_block_size", 31),
+                "ring adaptive threshold",
+            )
+            if block_size < 3:
+                raise ValueError("ring adaptive threshold block must be at least 3")
+            return cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                threshold_type,
+                block_size,
+                float(threshold_config.get("adaptive_c", 5)),
+            )
+        raise ValueError("ring threshold mode must be fixed or adaptive")
+
+    @staticmethod
+    def _merge_ring_centers(candidates, maximum_distance):
+        """Greedily merge concentric contours without a clustering library."""
+        groups = []
+        for candidate in sorted(
+            candidates, key=lambda item: item["area"], reverse=True
+        ):
+            matched = None
+            for group in groups:
+                center_x = sum(item["center"][0] for item in group) / len(group)
+                center_y = sum(item["center"][1] for item in group) / len(group)
+                distance = float(
+                    np.hypot(
+                        candidate["center"][0] - center_x,
+                        candidate["center"][1] - center_y,
+                    )
+                )
+                if distance <= maximum_distance:
+                    matched = group
+                    break
+            if matched is None:
+                groups.append([candidate])
+            else:
+                matched.append(candidate)
+        return groups
+
+    def _detect_ring_contours_in_roi(self, frame, roi_rect, parameters):
+        roi, offset_x, offset_y = _crop(frame, roi_rect)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        mask = self._make_ring_mask(gray, parameters["threshold"])
+        if self.ring_open_iterations:
+            mask = cv2.morphologyEx(
+                mask,
+                cv2.MORPH_OPEN,
+                self.ring_kernel,
+                iterations=self.ring_open_iterations,
+            )
+        if self.ring_close_iterations:
+            mask = cv2.morphologyEx(
+                mask,
+                cv2.MORPH_CLOSE,
+                self.ring_kernel,
+                iterations=self.ring_close_iterations,
+            )
+
+        contours, _hierarchy = cv2.findContours(
+            mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+        )
+        contour_config = parameters["contour"]
+        minimum_area = float(contour_config["min_area"])
+        maximum_area = float(contour_config["max_area"])
+        minimum_circularity = float(contour_config["min_circularity"])
+        minimum_aspect = float(contour_config["min_aspect_ratio"])
+        maximum_aspect = float(contour_config["max_aspect_ratio"])
+        candidates = []
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < minimum_area or area > maximum_area:
+                continue
+            perimeter = float(cv2.arcLength(contour, True))
+            if perimeter <= 0:
+                continue
+            circularity = float(4.0 * np.pi * area / (perimeter * perimeter))
+            box_x, box_y, width, height = cv2.boundingRect(contour)
+            aspect = float(width) / max(float(height), 1.0)
+            if (
+                circularity < minimum_circularity
+                or aspect < minimum_aspect
+                or aspect > maximum_aspect
+            ):
+                continue
+            moments = cv2.moments(contour)
+            if moments["m00"] == 0:
+                continue
+            center_x = float(moments["m10"] / moments["m00"] + offset_x)
+            center_y = float(moments["m01"] / moments["m00"] + offset_y)
+            global_contour = contour + np.asarray(
+                [[[offset_x, offset_y]]], dtype=contour.dtype
+            )
+            candidates.append(
+                {
+                    "center": [center_x, center_y],
+                    "area": area,
+                    "circularity": circularity,
+                    "aspect_ratio": aspect,
+                    "bbox": [box_x + offset_x, box_y + offset_y, width, height],
+                    "radius": (float(width) + float(height)) / 4.0,
+                    "quality": min(1.0, circularity),
+                    "contour": global_contour,
+                    "selected": False,
+                }
+            )
+
+        merge_distance = float(
+            parameters["clustering"].get("center_merge_distance_px", 12)
+        )
+        groups = self._merge_ring_centers(candidates, merge_distance)
+        minimum_members = max(
+            1,
+            int(parameters["clustering"].get("min_concentric_contours", 2)),
+        )
+        clusters = []
+        for group in groups:
+            if len(group) < minimum_members:
+                continue
+            center_x = sum(item["center"][0] for item in group) / len(group)
+            center_y = sum(item["center"][1] for item in group) / len(group)
+            quality = sum(item["quality"] for item in group) / len(group)
+            radius = max(item["radius"] for item in group)
+            group_index = len(clusters)
+            for candidate in group:
+                candidate["group_index"] = group_index
+            clusters.append(
+                {
+                    "center": [center_x, center_y],
+                    "radius": radius,
+                    "quality": quality,
+                    "members": len(group),
+                    "group_index": group_index,
+                    "ring_id": "UNKNOWN",
+                    "digit_score": 0.0,
+                    "digit_bbox": None,
+                }
+            )
+        debug = None
+        if self.circle_debug_enabled:
+            debug = {
+                "roi": _roi_values(roi_rect),
+                "processed": mask,
+                "candidates": candidates,
+                "selected": None,
+                "candidate_count": len(candidates),
+                "cluster_count": len(clusters),
+                "groups": clusters,
+                "threshold": dict(parameters["threshold"]),
+            }
+        self.last_circle_debug = debug
+        return clusters
+
+    @staticmethod
+    def _template_score(observed, template):
+        observed_pixels = observed > 0
+        template_pixels = template > 0
+        total = int(observed_pixels.sum()) + int(template_pixels.sum())
+        if total == 0:
+            return 0.0
+        intersection = int(np.logical_and(observed_pixels, template_pixels).sum())
+        return float(2.0 * intersection / total)
+
+    def _classify_ring_digit(self, frame, cluster):
+        config = self.ring_digit_config
+        center_x, center_y = cluster["center"]
+        crop_ratio = float(config.get("crop_radius_ratio", 0.55))
+        half_size = max(8, int(round(cluster["radius"] * crop_ratio)))
+        left = max(0, int(round(center_x)) - half_size)
+        top = max(0, int(round(center_y)) - half_size)
+        right = min(frame.shape[1], int(round(center_x)) + half_size + 1)
+        bottom = min(frame.shape[0], int(round(center_y)) + half_size + 1)
+        if right - left < 8 or bottom - top < 8:
+            return "UNKNOWN", 0.0, [left, top, right - left, bottom - top], None
+        gray = cv2.cvtColor(frame[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+        mask = self._foreground_mask(
+            gray, bool(config.get("image_invert", True))
+        )
+        normalized = self._normalize_digit(
+            mask,
+            max(24, int(config.get("template_size", 64))),
+            max(1, int(config.get("padding_px", 5))),
+        )
+        if normalized is None:
+            return "UNKNOWN", 0.0, [left, top, right - left, bottom - top], None
+        scores = {}
+        for digit, templates in self.ring_digit_templates.items():
+            scores[digit] = max(
+                self._template_score(normalized, template)
+                for template in templates
+            )
+        digit, score = max(scores.items(), key=lambda item: item[1])
+        if score < float(config.get("min_score", 0.55)):
+            digit = "UNKNOWN"
+        return digit, float(score), [left, top, right - left, bottom - top], normalized
 
     def detect_ring(self, frame, ring_id, scene):
         scene = scene.upper()
+        ring_id = str(ring_id)
+        if ring_id not in ("1", "2", "3"):
+            raise KeyError("unknown ring id: %s" % ring_id)
         scene_config = self.config["scenes"].get(scene)
-        if scene_config is None or str(ring_id) not in scene_config.get("ring_rois", {}):
-            raise KeyError("ring ROI is not configured")
-        circle = self._detect_circle_in_roi(
-            frame,
-            scene_config["ring_rois"][str(ring_id)],
-            self.config["ring_detection"],
+        if scene_config is None:
+            raise KeyError("ring scene is not configured")
+        digit_enabled = bool(self.ring_digit_config.get("enabled", False))
+        if digit_enabled:
+            search_roi = scene_config.get(
+                "ring_search_roi", scene_config.get("object_roi")
+            )
+        else:
+            search_roi = scene_config.get("ring_rois", {}).get(ring_id)
+        if search_roi is None:
+            raise KeyError("ring search ROI is not configured")
+        clusters = self._detect_ring_contours_in_roi(
+            frame, search_roi, self.config["ring_detection"]
         )
-        if circle is None:
+        normalized_digits = {}
+        if digit_enabled:
+            for cluster in clusters:
+                digit, score, bbox, normalized = self._classify_ring_digit(
+                    frame, cluster
+                )
+                cluster["ring_id"] = digit
+                cluster["digit_score"] = score
+                cluster["digit_bbox"] = bbox
+                if normalized is not None:
+                    normalized_digits[cluster["group_index"]] = normalized
+            matches = [
+                cluster for cluster in clusters if cluster["ring_id"] == ring_id
+            ]
+        else:
+            matches = clusters
+        selected = (
+            max(
+                matches,
+                key=lambda cluster: (
+                    cluster["digit_score"] if digit_enabled else 1.0,
+                    cluster["members"],
+                    cluster["quality"],
+                ),
+            )
+            if matches
+            else None
+        )
+        if self.last_circle_debug is not None:
+            self.last_circle_debug["kind"] = "RING"
+            self.last_circle_debug["target_id"] = ring_id
+            self.last_circle_debug["scene"] = scene
+            self.last_circle_debug["template_source"] = self.ring_template_source
+            self.last_circle_debug["normalized_digits"] = normalized_digits
+            self.last_circle_debug["selected"] = selected
+            if selected is not None:
+                for candidate in self.last_circle_debug["candidates"]:
+                    candidate["selected"] = (
+                        candidate.get("group_index")
+                        == selected["group_index"]
+                    )
+        if selected is None:
             return None
-        x_px, y_px, _, quality = circle
+        x_px, y_px = selected["center"]
+        quality = selected["quality"]
+        if digit_enabled:
+            quality = min(quality, selected["digit_score"])
         x, y, unit = self.calibration.map(scene, x_px, y_px)
         return Measurement(
             "RING",
-            str(ring_id),
+            ring_id,
             x,
             y,
             0.0,

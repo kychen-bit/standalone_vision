@@ -4,7 +4,7 @@
 
 ```text
 USB相机 → 固定ROI → HSV inRange → 开/闭运算
-→ findContours → 面积过滤 → moments质心 → 连续3帧稳定
+→ findContours → 面积过滤 → moments质心 → 连续5帧稳定
 → 可选动态ROI（漏检时同帧回退固定ROI）
 ```
 
@@ -99,6 +99,6 @@ python3 -m compileall -q jetson_recognition tools tests
 
 - `camera.py`：相机和 V4L2；
 - `detectors.py`：HSV、Mask、轮廓、面积、质心；
-- `stability.py`：简单三帧稳定以及旧辅助模式所需稳定窗口；
+- `stability.py`：简单五帧颜色稳定以及旧辅助模式所需稳定窗口；
 - `run.py`：命令行、显示和输出；
 - `output.py` / `coordinator.py`：已有通信协议。

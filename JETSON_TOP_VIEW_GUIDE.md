@@ -23,19 +23,16 @@ Jetson（俯视识别 + 协调服务）
 
 Jetson 正式运行应使用 `coordinator`，不是 `live`、`image`、`pickup` 或 `bridge`。后四者是单项测试工具。
 
-不过，**当前代码和配置还不能直接启动完整比赛任务**。至少存在以下上场阻塞项：
+公共通信 P0 已完成代码修复和无硬件 CRC 闭环测试。完整上车前仍需处理现场配置项：
 
 1. `config/jetson.json` 中两路串口仍是 `REPLACE_WITH_...`；
-2. `coordinator.pickup.capture_zone_px` 仍为 `null`，首个 `PICK` 请求会抛异常并退出；
-3. 三个平面都未标定，当前只能返回 `PX`，不能直接当毫米坐标使用；
-4. 合法任务码到达后，`TASK_PLAN` 把 `1,5,6,5,1,6` 作为一个字段发送，但协议禁止字段内部含逗号，实际编码会报 `ValueError: invalid serial field`，协调进程退出；
-5. 两路串口均使用 `timeout=0.2` 串行轮询。无数据时一轮最多阻塞约 0.4 秒，正式循环最差约 2.5 Hz，与当前 60 FPS 相机配置不匹配；
-6. `GRASP_READY` 发出后协调器进入 `WAIT_DONE`，不再处理后续图像，所以正式模式并不能像单独 `pickup` 模式那样在目标丢失后撤销许可；
-7. 标定工具只写顶层 `pickup.capture_zone_px`，正式协调器读取的是 `coordinator.pickup.capture_zone_px`，需要手工复制；
-8. 任务码的放置环号没有自动进入 `PLACE/STACK` 流程；电控仍需解析原始任务码或显式给每个请求传环号。
-9. 协调器只在 `BUSY` 状态拒绝新请求；处于 `WAIT_DONE` 时收到新 `REQ` 会直接覆盖上一请求，而不是回复 `BUSY`，因此当前状态机不能强制电控先发 `DONE`。
+2. 三个平面都未标定，当前只能返回 `PX`，不能直接当毫米坐标使用；
+3. 任务码的放置环号没有自动进入 `PLACE/STACK` 流程；电控仍需解析原始任务码或显式给每个请求传环号；
+4. `GRASP_READY` 当前代表“颜色中心稳定”，电控仍需负责像素坐标到实际动作的换算和安全判断；
+5. 真实 Maix—Jetson—电控双串口硬件还未接线验证。
 
-因此，现阶段可以完成算法单测和分板联调，但完整上车前应先修复第 4～8 项，并完成实机 ROI、HSV、抓取窗口和坐标标定。
+已修复的公共问题包括：`TASK_PLAN` 可编码、串口非阻塞、五帧稳定、许可有效期与 `EXEC` 握手、
+新请求状态门、自动颜色队列在 `DONE OK` 后推进以及发送异常保护。
 
 ## 2. 赛题对视觉的实际要求
 
@@ -133,10 +130,10 @@ Maix 默认 `SERIAL_ENABLED = False`，联合运行前必须在 `maixcam_pro/con
 ```text
 START → READY
 Maix任务码 → TASK_PLAN
-REQ PICK → ACCEPTED → GRASP_READY → DONE OK/FAIL
+REQ PICK → ACCEPTED → GRASP_READY → EXEC → DONE OK/FAIL
 REQ PLACE → ACCEPTED → ALIGN_READY → DONE OK/FAIL
 REQ STACK → ACCEPTED → ALIGN_READY → DONE OK/FAIL
-ABORT → 回到 IDLE（当前无 ABORT_ACK）
+ABORT → ABORTED → 回到 IDLE
 ```
 
 所有线上帧都必须是：
@@ -155,7 +152,8 @@ CRC 算法是 CRC16/CCITT-FALSE，初值 `0xFFFF`，多项式 `0x1021`，计算�
 REQ,0001,PICK
 ```
 
-使用任务颜色队列的下一个颜色。当前代码在收到 `REQ` 时立即推进队列，并不是等 `DONE OK` 才推进。发生超时后若再次使用自动颜色，请求可能跳到下一个颜色；恢复时更安全的做法是显式指定颜色。
+使用任务颜色队列的当前颜色。只有收到同请求的 `DONE OK` 后才推进；超时、许可撤销和
+`DONE FAIL` 都保持当前颜色。恢复时仍建议显式指定颜色。
 
 ```text
 REQ,0002,PICK,TURNTABLE,5
@@ -198,7 +196,8 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q jetson_recognition maixcam_pro tests tools
 ```
 
-本次静态环境中 28 项单元测试全部通过，但这些测试不打开相机和串口，也没有覆盖 `TASK_PLAN` 的最终编码。
+当前测试包含最终 CRC 编解码，以及使用真实 HSV 检测器的模拟电控颜色闭环；真实相机和双串口
+仍需上板验证。
 
 ### 5.2 查三个设备名
 
@@ -261,9 +260,10 @@ v4l2-ctl -d /dev/video0 --list-ctrls
     "timeout_s": 20.0,
     "max_attempts": 3,
     "target_report_every": 0,
-    "pickup": {
-      "capture_zone_px": [X, Y, W, H]
-    }
+    "action_timeout_s": 30.0,
+    "result_valid_ms": 250,
+    "revoke_after_misses": 2,
+    "require_exec_ack": true
   }
 }
 ```
@@ -271,13 +271,19 @@ v4l2-ctl -d /dev/video0 --list-ctrls
 还必须用实拍数据调整：
 
 - `scenes.TURNTABLE.object_roi`：转盘物料搜索范围；
-- `scenes.ROUGH.ring_rois.1/2/3`：粗加工区三个圆环的局部 ROI；
-- `scenes.STORAGE.ring_rois.1/2/3`：暂存区三个圆环的局部 ROI；
+- `scenes.ROUGH.ring_search_roi`：机械臂相机可能看到的粗加工工位搜索范围；
+- `scenes.STORAGE.ring_search_roi`：暂存工位搜索范围；`ring_rois.1/2/3` 仅保留给旧兼容路径和 STACK；
 - `colors.1..6.ranges`：六种实物在现场光照下的 HSV 范围；
 - 颜色面积、形状过滤和圆半径范围；
-- `runtime` 与 `coordinator.pickup` 的稳定、速度、超时参数。
+- `stability` 的颜色连续稳定帧数和中心允许偏移；
+- `runtime` 的圆环/堆叠稳定参数，以及 `coordinator` 的等待、许可有效期和动作超时参数。
 
-### 6.1 抓取窗口标定的当前注意事项
+### 6.1 旧版单项 `pickup` 抓取窗口工具
+
+下面的工具只服务于旧版单项 `pickup` 测试命令，不参与当前正式
+`coordinator` 的 `REQ → GRASP_READY → EXEC → DONE` 闭环。正式模式只给出颜色中心，
+导航、图像坐标到机械动作的换算和安全抓取窗口判断均由电控负责，因此部署正式协议时不需要配置
+或复制 `coordinator.pickup`。
 
 带桌面：
 
@@ -303,13 +309,8 @@ python3 tools/capture_zone_calibrator.py \
 pickup.capture_zone_px
 ```
 
-保存后必须把相同的 `[X,Y,W,H]` 手工复制到：
-
-```text
-coordinator.pickup.capture_zone_px
-```
-
-否则单独 `pickup` 能运行，正式 `coordinator` 的 `PICK` 仍会失败。
+该值仅供 `python3 -m jetson_recognition.run pickup ...` 使用。若未来确实需要在 Jetson
+正式协调器中增加第二层抓取安全窗口，应单独设计明确的配置字段和协议语义，不要复用这一旧配置。
 
 ### 6.2 坐标标定
 
@@ -449,16 +450,16 @@ python3 -m jetson_recognition.run image frame.jpg \
 5. 电控一键启动后发送 `START,<run_id>`，等待 `READY,<run_id>`；
 6. 让 Maix 扫到二维码，电控接收并核对 `TASK_PLAN`；
 7. 电控移动到原料观察位，发第一个 `REQ,...,PICK`；
-8. 收到 `GRASP_READY` 后立即按约定坐标执行，完整抓取并把物料放上车载平台，再发 `DONE,<seq>,OK`；
+8. 收到 `GRASP_READY` 后在 `valid_ms` 内回复 `EXEC,<seq>`，收到 `EXEC_ACK` 才执行；完整抓取并放上车载平台后发 `DONE,<seq>,OK`；
 9. 到粗加工区后，电控按任务码环号发 `PLACE`；
 10. 到暂存区后，第一批可按环号放置，第二批发 `STACK` 找同色物料中心；
-11. 每次完整动作结束都必须发 `DONE`；当前代码在 `WAIT_DONE` 时错误地允许新 `REQ` 覆盖上一请求，电控不能依赖 Jetson 替自己拦截这种时序错误；
+11. 每次完整动作结束都必须发 `DONE`；`WAIT_EXEC/WAIT_DONE` 中的新 `REQ` 会被明确拒绝；
 12. 异常时发 `ABORT,<run_id>`，重新建立明确状态。
 
 正式比赛前不要只验证“看到了目标”，必须完整走通：
 
 ```text
-START → MAIX_QR → TASK_PLAN → 6次PICK → PLACE/STACK → 每次DONE → ABORT/结束
+START → MAIX_QR → TASK_PLAN → 6次PICK（每次GRASP_READY/EXEC/DONE）→ PLACE/STACK → ABORT/结束
 ```
 
 ## 9. 实时性分析
@@ -467,7 +468,7 @@ START → MAIX_QR → TASK_PLAN → 6次PICK → PLACE/STACK → 每次DONE → 
 
 - HSV 阈值数组、形态学核和 CLAHE 对象只在启动时创建，不再逐帧重复分配；
 - 静止/连续目标优先在上一位置附近的小 ROI 检测，失败时在同一帧自动回退全场景 ROI；
-- 圆环霍夫检测支持 `processing_scale`，当前主圆环配置为 0.75；
+- 圆环在工位搜索 ROI 内找出全部同心轮廓，再动态裁剪中央数字做 1/2/3 模板匹配；
 - 相机采集线程持续排空 V4L2，算法只取得最新帧，避免处理积压旧画面；
 - 相机启动后回读实际宽、高、FPS 和 FourCC；不匹配时告警，`strict_settings=true` 可改为直接拒绝启动；
 - OpenCV 优化开启，线程数由 `runtime.opencv_threads` 配置；
@@ -475,7 +476,7 @@ START → MAIX_QR → TASK_PLAN → 6次PICK → PLACE/STACK → 每次DONE → 
 - `STATION/TURNTABLE` 默认关闭，但保留配置接口。
 
 本次无相机开发环境的合成图多轮基准：稳定颜色目标约 1.2～1.5 ms/帧，强制全 ROI 约
-7.3～10.4 ms/帧，单圆环约 2.0～2.2 ms/帧。该数字只说明代码优化有效，Jetson 实机结果必须用下面
+当前合成三圆与内置模板约 4.6 ms/帧。该数字只说明代码链路可实时运行，Jetson 实机结果必须用下面
 的工具重新测量：
 
 ```bash
@@ -510,17 +511,17 @@ python3 tools/benchmark_detector.py --camera /dev/v4l/by-id/实际相机设备 \
 
 ### 9.2 当前瓶颈优先级
 
-**P0：串口阻塞。** `coordinator.py` 对 Maix、MCU 两个串口依次执行读取，每个端口超时 0.2 秒。两边无数据时图像采集被阻塞约 0.4 秒。应改成非阻塞读取（`timeout=0`）、`select/poll` 或独立串口线程。
+**已修复：串口阻塞。** Maix、MCU 两路串口均使用 `timeout=0`，不会把无数据等待叠加到相机循环。
 
-**P0：许可有效性。** 正式协调器发出 `GRASP_READY` 后不再更新图像，无法撤销已经失效的许可。应继续监视到电控开始动作，或在帧中携带并强制执行很短的有效期/握手。
+**已修复：许可有效性。** `GRASP_READY` 携带 `valid_ms`；Jetson 在收到同序号 `EXEC` 前持续复检，丢失、失稳或过期会发送 `GRASP_REVOKED`。
 
-**P0：端到端异常。** `TASK_PLAN` 编码、未配置抓取窗口、错误 ROI 等异常可能让整个进程退出。正式服务应捕获异常、发送 `ERROR` 并保持进程存活。
+**已修复：端到端编码。** `TASK_PLAN` 的队列元素拆成独立字段，错误帧不再含空字段；发送编码异常会记录 `COORDINATOR_TX_ERROR` 而不退出服务。
 
 **P1：相机与处理解耦。** 建议使用采集线程持续取最新帧，队列长度为 1，识别永远处理最新画面，不积压旧帧。
 
-**P1：坐标与任务状态。** 自动颜色队列应在 `DONE OK` 后提交推进，超时/失败能回滚；任务码应输出结构化的两批颜色—环号对应关系。
+**部分完成：坐标与任务状态。** 自动颜色队列已在 `DONE OK` 后提交推进，超时/失败不推进；毫米坐标和放置环自动计划仍待实机方案确认。
 
-**P1：状态转换校验。** `REQ` 只能在明确的 `TASK_READY` 状态接受，`WAIT_DONE` 必须拒绝新请求；重复 `START`、`ABORT`、过期 `DONE` 也应有确定且可观测的处理。
+**已修复：状态转换校验。** `REQ` 只在 `TASK_READY` 接受；`WAIT_EXEC/WAIT_DONE` 拒绝覆盖；`ABORT` 返回 `ABORTED`，错误序号和错误状态可观测。
 
 **P1：性能观测。** 增加实际采集 FPS、处理 FPS、单帧耗时、REQ 到 READY 延迟、丢帧数和串口 CRC 错误计数。没有这些指标无法判断“实时”。
 
@@ -528,7 +529,7 @@ python3 tools/benchmark_detector.py --camera /dev/v4l/by-id/实际相机设备 \
 
 - 先测试 1280×720 MJPG 60 FPS；若 `camera_settings` 未协商到 60 FPS，或 Jetson 的
   `wall_fps`、温度和功耗不稳定，再把配置退回 30 FPS 对比；
-- ROI 要尽量小，当前颜色检测、霍夫圆检测都会随 ROI 面积增加而变慢；
+- ROI 要尽量小，当前颜色与圆环检测都会随 ROI 面积增加而变慢；
 - 只有收到 `REQ` 时才做目标算法，当前代码已经基本符合这一点；
 - 不要为追求帧率盲目减少稳定帧，先测转盘停止到 `GRASP_READY` 的真实延迟；
 - 锁定曝光、增益、白平衡，垂直向下补光，避免 HSV 阈值随时间漂移；
@@ -536,12 +537,12 @@ python3 tools/benchmark_detector.py --camera /dev/v4l/by-id/实际相机设备 \
 
 ## 10. 上场前检查表
 
-- [ ] 修复 `TASK_PLAN` 含逗号字段导致的编码崩溃；
-- [ ] 两路串口改为非阻塞或事件驱动，实测循环频率；
-- [ ] 正式 `GRASP_READY` 具备有效期或持续复检机制；
-- [ ] 抓取窗口标定值同时进入 `coordinator.pickup`；
-- [ ] 明确自动任务队列在超时、失败和重试时的推进规则；
-- [ ] 修复 `WAIT_DONE` 仍可接受新 `REQ` 并覆盖旧请求的问题；
+- [x] 修复 `TASK_PLAN` 含逗号字段导致的编码崩溃；
+- [x] 两路串口改为非阻塞读取；实机仍需测循环频率；
+- [x] 正式 `GRASP_READY` 具备有效期、持续复检和 `EXEC` 握手；
+- [ ] 电控完成图像坐标到夹爪/底盘动作的换算与安全窗口判断；
+- [x] 自动任务队列只在 `DONE OK` 后推进，超时、失败和重试不推进；
+- [x] 修复 `WAIT_EXEC/WAIT_DONE` 新 `REQ` 覆盖旧请求的问题；
 - [ ] 电控能够解析完整任务码中的颜色—环号对应关系；
 - [ ] 三个场景 ROI 都基于实机 1280×720 画面重画；
 - [ ] 六色 HSV 在正常光、阴影、反光、转盘运动条件下测试；
@@ -559,7 +560,7 @@ Jetson 正式服务只需要暴露四类业务输入输出：
 ```text
 输入：MAIX_QR
 输入：REQ PICK / PLACE / STACK
-输入：DONE / ABORT
+输入：EXEC / DONE / ABORT
 输出：TASK_PLAN / GRASP_READY / ALIGN_READY / ERROR
 ```
 
