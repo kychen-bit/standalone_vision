@@ -117,6 +117,40 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(frames, [("ERROR", ["NONE", "BAD_TASK_CODE"])])
         encode_frame(frames[0][0], *frames[0][1])
 
+    def test_duplicate_task_code_is_idempotent(self):
+        _, _, coordinator = fresh_coordinator()
+        start_with_task(coordinator)
+        status = coordinator.accept_task_code(TASK)
+        self.assertEqual(status, "DUPLICATE")
+        self.assertEqual(coordinator.drain(), [])
+        self.assertEqual(coordinator.queue_index, 0)
+        self.assertEqual(coordinator.state, "TASK_READY")
+
+    def test_different_task_code_cannot_replace_locked_plan(self):
+        _, _, coordinator = fresh_coordinator()
+        start_with_task(coordinator)
+        original_queue = list(coordinator.queue)
+
+        status = coordinator.accept_task_code("426+213+436+231")
+
+        self.assertEqual(status, "LOCKED")
+        self.assertEqual(coordinator.task_raw, TASK)
+        self.assertEqual(coordinator.queue, original_queue)
+        self.assertEqual(coordinator.drain(), [])
+
+    def test_new_start_clears_task_lock_and_accepts_new_plan(self):
+        _, _, coordinator = fresh_coordinator()
+        start_with_task(coordinator)
+        replacement = "426+213+436+231"
+
+        coordinator.on_mcu_frame("START", ["RUN002"])
+        self.assertEqual(coordinator.drain(), [("READY", ["RUN002"])])
+        status = coordinator.accept_task_code(replacement)
+
+        self.assertEqual(status, "ACCEPTED")
+        self.assertEqual(coordinator.task_raw, replacement)
+        self.assertEqual(coordinator.drain()[0][0], "TASK_PLAN")
+
     def test_pick_grant_requires_five_frames_and_exec(self):
         reds = [measurement(100, 100) for _ in range(12)]
         _, _, coordinator = fresh_coordinator({("COLOR", "1"): reds})
@@ -137,6 +171,23 @@ class CoordinatorTests(unittest.TestCase):
         coordinator.on_mcu_frame("EXEC", ["001"])
         self.assertEqual(coordinator.drain(), [("EXEC_ACK", ["001"])])
         self.assertEqual(coordinator.state, "WAIT_DONE")
+
+    def test_pick_sends_stable_window_center_not_last_frame(self):
+        samples = [
+            measurement(x, 100)
+            for x in (100, 102, 101, 99, 103)
+        ]
+        _, _, coordinator = fresh_coordinator({("COLOR", "1"): samples})
+        start_with_task(coordinator)
+        coordinator.on_mcu_frame("REQ", ["AVG001", "PICK"])
+        coordinator.drain()
+
+        frames = feed_frames(coordinator, 5)
+
+        grasp = next(fields for name, fields in frames if name == "GRASP_READY")
+        self.assertEqual(grasp[2], "101.000")
+        self.assertEqual(grasp[5], "101.000")
+        self.assertNotEqual(grasp[2], "103.000")
 
     def test_done_ok_advances_auto_queue_only_after_exec(self):
         reds = [measurement(100, 100) for _ in range(12)]

@@ -59,9 +59,9 @@ class TopViewDetector:
         )
         self.calibration = PlaneCalibration(calibration_path)
 
-        # COLOR_V1 intentionally stays small: fixed ROI, HSV inRange,
-        # morphology, contour area and moments. Complex classifiers belong in
-        # a future optional detector, not in the default competition path.
+        # COLOR_V1 intentionally stays small: ROI, HSV inRange, morphology,
+        # convex outer contour and basic geometry. Complex classifiers belong
+        # in a future optional detector, not in the competition path.
         self.color_ranges = {}
         self.color_names = {}
         self.black_threshold = None
@@ -110,6 +110,19 @@ class TopViewDetector:
         configured_max = geometry.get("max_area")
         self.color_max_area = (
             float(configured_max) if configured_max is not None else float("inf")
+        )
+        self.color_min_aspect_ratio = float(
+            geometry.get("min_aspect_ratio", 0.65)
+        )
+        self.color_max_aspect_ratio = float(
+            geometry.get("max_aspect_ratio", 1.55)
+        )
+        if not (
+            0 < self.color_min_aspect_ratio <= self.color_max_aspect_ratio
+        ):
+            raise ValueError("invalid color aspect-ratio limits")
+        self.color_border_margin = max(
+            0, int(geometry.get("border_margin_px", 10))
         )
         dynamic_roi = color_config.get("dynamic_roi", {})
         self.dynamic_roi_enabled = bool(dynamic_roi.get("enabled", False))
@@ -398,9 +411,7 @@ class TopViewDetector:
         # added after this mask if blue/light-blue HSV ranges truly overlap.
         return mask
 
-    def _color_candidate(
-        self, frame, color_id, roi_rect, scene_config, reject_border=False
-    ):
+    def _color_candidate(self, frame, color_id, roi_rect, scene_config):
         roi, offset_x, offset_y = _crop(frame, roi_rect)
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         mask = self._make_color_mask(hsv, color_id)
@@ -424,6 +435,7 @@ class TopViewDetector:
         filter_stats = {
             "raw_contours": len(contours),
             "area_rejected": 0,
+            "shape_rejected": 0,
             "border_rejected": 0,
             "accepted": 0,
             "area_limits_px": [minimum, maximum if np.isfinite(maximum) else None],
@@ -431,27 +443,40 @@ class TopViewDetector:
         candidates = []
         debug_candidates = []
         for contour in contours:
-            area = float(cv2.contourArea(contour))
+            # The real material is rotationally symmetric. Using its convex
+            # outer silhouette keeps the center stable when glare removes a
+            # notch from the color mask, without adding contour clustering.
+            hull = cv2.convexHull(contour)
+            area = float(cv2.contourArea(hull))
             if area < minimum or area > maximum:
                 filter_stats["area_rejected"] += 1
                 continue
-            moments = cv2.moments(contour)
+            box_x, box_y, width, height = cv2.boundingRect(hull)
+            aspect_ratio = float(width) / max(float(height), 1.0)
+            if not (
+                self.color_min_aspect_ratio
+                <= aspect_ratio
+                <= self.color_max_aspect_ratio
+            ):
+                filter_stats["shape_rejected"] += 1
+                continue
+            margin = self.color_border_margin
+            if (
+                box_x <= margin
+                or box_y <= margin
+                or box_x + width >= roi.shape[1] - margin
+                or box_y + height >= roi.shape[0] - margin
+            ):
+                # A clipped target has an unreliable center and should never
+                # be handed to the gripper, regardless of its color.
+                filter_stats["border_rejected"] += 1
+                continue
+            moments = cv2.moments(hull)
             if moments["m00"] == 0:
                 filter_stats["area_rejected"] += 1
                 continue
             center_x = moments["m10"] / moments["m00"] + offset_x
             center_y = moments["m01"] / moments["m00"] + offset_y
-            box_x, box_y, width, height = cv2.boundingRect(contour)
-            if reject_border and (
-                box_x <= 1
-                or box_y <= 1
-                or box_x + width >= roi.shape[1] - 1
-                or box_y + height >= roi.shape[0] - 1
-            ):
-                # A clipped contour has a biased center. Reject this fast pass
-                # and retry the fixed ROI in the same frame.
-                filter_stats["border_rejected"] += 1
-                continue
             confidence = min(1.0, area / max(minimum * 2.0, 1.0))
             global_box = [box_x + offset_x, box_y + offset_y, width, height]
             candidate = (
@@ -461,7 +486,7 @@ class TopViewDetector:
             candidates.append(candidate)
             filter_stats["accepted"] += 1
             if self.color_debug_enabled:
-                global_contour = contour + np.asarray(
+                global_contour = hull + np.asarray(
                     [[[offset_x, offset_y]]], dtype=contour.dtype
                 )
                 debug_candidates.append(
@@ -470,6 +495,7 @@ class TopViewDetector:
                         "contour": global_contour,
                         "center": [float(center_x), float(center_y)],
                         "area": area,
+                        "aspect_ratio": aspect_ratio,
                         "quality": confidence,
                         "accepted": True,
                     }
@@ -517,7 +543,7 @@ class TopViewDetector:
                 base_roi, self._last_color_boxes[key]
             )
             candidate = self._color_candidate(
-                frame, color_id, active_roi, scene_config, reject_border=True
+                frame, color_id, active_roi, scene_config
             )
             if candidate is not None:
                 roi_mode = "DYNAMIC_ROI"
@@ -981,10 +1007,13 @@ class TopViewDetector:
         scene_config = self.config["scenes"].get(scene.upper())
         if scene_config is None or str(ring_id) not in scene_config.get("ring_rois", {}):
             raise KeyError("stack ring ROI is not configured")
+        # The camera is mounted on the arm, so a stored object must not be
+        # assumed to remain inside a hard-coded image-space ring rectangle.
+        # Search the scene-level work area for the requested same-color object;
+        # ring_id remains validated as task metadata for protocol consistency.
         return self.detect_color(
             frame,
             color_id,
             scene,
-            roi_override=scene_config["ring_rois"][str(ring_id)],
             kind="STACK",
         )

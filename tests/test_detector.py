@@ -104,20 +104,26 @@ class DetectorTests(unittest.TestCase):
         cv2.rectangle(frame, (300, 300), (400, 400), self.SCREEN_COLORS["1"], -1)
 
         required_frames = int(config["stability"]["stable_frames"])
+        duration_ms = float(config["stability"]["min_stable_time_ms"])
+        update_count = max(required_frames, int(duration_ms // 20.0) + 2)
         stable = None
-        for _ in range(required_frames):
-            _measurement, stable, _count = session.update(frame)
+        for index in range(update_count):
+            _measurement, stable, _count = session.update(
+                frame, timestamp=index * 0.02
+            )
         self.assertIsNotNone(stable)
         self.assertEqual(engine.detector.last_color_runtime["mode"], "FIXED_ROI")
 
-        session.update(frame)
+        session.update(frame, timestamp=update_count * 0.02)
         runtime = engine.detector.last_color_runtime
         self.assertEqual(runtime["mode"], "DYNAMIC_ROI")
         self.assertLess(runtime["roi"][2], runtime["base_roi"][2])
 
         moved = np.zeros((720, 1280, 3), dtype=np.uint8)
         cv2.rectangle(moved, (850, 300), (950, 400), self.SCREEN_COLORS["1"], -1)
-        measurement, _stable, _count = session.update(moved)
+        measurement, _stable, _count = session.update(
+            moved, timestamp=(update_count + 1) * 0.02
+        )
         self.assertIsNotNone(measurement)
         self.assertEqual(engine.detector.last_color_runtime["mode"], "FIXED_ROI")
         self.assertAlmostEqual(measurement.pixel_x, 900.0, delta=2.0)
@@ -127,6 +133,33 @@ class DetectorTests(unittest.TestCase):
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         cv2.rectangle(frame, (500, 300), (505, 305), self.SCREEN_COLORS["1"], -1)
         self.assertIsNone(detector.detect_color(frame, "1", "PAPER_TEST"))
+
+    def test_color_candidate_touching_roi_border_is_rejected(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        # PAPER_TEST begins at x=160, so this otherwise valid red circle is
+        # clipped by the search ROI and has an unsafe center estimate.
+        cv2.circle(frame, (170, 350), 45, self.SCREEN_COLORS["1"], -1)
+        self.assertIsNone(detector.detect_color(frame, "1", "PAPER_TEST"))
+
+    def test_color_candidate_rejects_long_environment_strip(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cv2.rectangle(frame, (350, 330), (800, 370), self.SCREEN_COLORS["1"], -1)
+        self.assertIsNone(detector.detect_color(frame, "1", "PAPER_TEST"))
+
+    def test_convex_hull_center_tolerates_reflective_edge_notch(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cv2.circle(frame, (550, 350), 65, self.SCREEN_COLORS["1"], -1)
+        # Simulate a highlight cutting a narrow notch through the color mask.
+        cv2.rectangle(frame, (545, 330), (620, 370), (0, 0, 0), -1)
+
+        result = detector.detect_color(frame, "1", "PAPER_TEST")
+
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result.pixel_x, 550.0, delta=8.0)
+        self.assertAlmostEqual(result.pixel_y, 350.0, delta=4.0)
 
     def test_unknown_irregular_shape_is_accepted(self):
         detector = TopViewDetector(load_config(), ROOT)
@@ -140,6 +173,25 @@ class DetectorTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result.pixel_x, 535.0, delta=15.0)
         self.assertAlmostEqual(result.pixel_y, 337.0, delta=15.0)
+
+    def test_stack_searches_storage_scene_roi_not_fixed_ring_box(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        # Ring 1's legacy box is near x=160..400. An arm-mounted camera can
+        # observe the same stored red object elsewhere in the station ROI.
+        cv2.rectangle(frame, (900, 300), (1020, 420), self.SCREEN_COLORS["1"], -1)
+
+        result = detector.detect_stack(frame, "1", "STORAGE", "1")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "STACK")
+        self.assertEqual(result.target_id, "1")
+        self.assertAlmostEqual(result.pixel_x, 960.0, delta=2.0)
+        self.assertAlmostEqual(result.pixel_y, 360.0, delta=2.0)
+        self.assertEqual(
+            detector.last_color_runtime["base_roi"],
+            [80, 170, 1120, 430],
+        )
 
     def test_black_uses_value_not_hue(self):
         detector = TopViewDetector(load_config(), ROOT)
@@ -200,7 +252,12 @@ class DetectorTests(unittest.TestCase):
                 self.assertAlmostEqual(result.pixel_y, 370.0, delta=3.0)
 
     def test_ring_debug_exposes_mask_contours_and_selected_cluster(self):
-        detector = TopViewDetector(load_config(), ROOT)
+        config = load_config()
+        # Keep the debug-coordinate fixture independent of field ROI tuning.
+        config["scenes"]["ROUGH"]["ring_search_roi"] = {
+            "x": 80, "y": 170, "width": 1120, "height": 430,
+        }
+        detector = TopViewDetector(config, ROOT)
         detector.set_circle_debug(True)
         frame = np.full((720, 1280, 3), 200, dtype=np.uint8)
         draw_numbered_ring(frame, (640, 370), "2")
@@ -231,13 +288,19 @@ class DetectorTests(unittest.TestCase):
         draw_numbered_ring(frame, (640, 370), "2")
 
         required = int(config["ring_detection"]["stability"]["stable_frames"])
+        duration_ms = float(
+            config["ring_detection"]["stability"]["min_stable_time_ms"]
+        )
+        update_count = max(required, int(duration_ms // 20.0) + 2)
         stable = None
-        for index in range(required):
-            _measurement, stable, count = session.update(frame)
-            if index < required - 1:
+        for index in range(update_count):
+            _measurement, stable, count = session.update(
+                frame, timestamp=index * 0.02
+            )
+            if index < update_count - 1:
                 self.assertIsNone(stable)
         self.assertIsNotNone(stable)
-        self.assertEqual(count, required)
+        self.assertGreaterEqual(count, required)
 
     def test_ring_contour_tolerates_moderate_camera_tilt(self):
         detector = TopViewDetector(load_config(), ROOT)

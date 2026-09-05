@@ -4,7 +4,8 @@
 
 ```text
 USB相机 → 固定ROI → HSV inRange → 开/闭运算
-→ findContours → 面积过滤 → moments质心 → 连续5帧稳定
+→ findContours → 凸包中心 → 面积/宽高比/贴边过滤
+→ 至少8帧且至少250ms稳定
 → 可选动态ROI（漏检时同帧回退固定ROI）
 ```
 
@@ -67,26 +68,45 @@ Jetson 默认通过 `gstreamer_nv` 对 USB 相机 MJPEG 做硬件解码；识别
 - `camera`：设备、分辨率、帧率及可选 V4L2 档；
 - `scenes.*.object_roi`：`x/y/width/height` 固定 ROI；
 - `color_detection.morphology`：核尺寸、开/闭次数；
-- `color_detection.geometry`：默认面积范围；
+- `color_detection.geometry`：默认面积、宽高比和ROI边缘范围；
 - `color_detection.dynamic_roi`：稳定后局部 ROI 开关和外扩边距；
 - `scenes.*.min_area/max_area`：场景面积覆盖值；
-- `stability`：连续帧数和相邻中心最大位移；
+- `stability`：连续帧数、最短稳定时间和中心最大位移；
 - `colors`：五种彩色 HSV 范围及黑色简单 V/S 阈值。
 
-详细调试顺序和命令见 [JETSON_RECOGNITION_TEST_GUIDE.md](JETSON_RECOGNITION_TEST_GUIDE.md)。
+全部文档入口见 [docs/README.md](docs/README.md)，电控请直接阅读
+[电控与 Jetson 对接协议](docs/电控对接协议.md)。
+
+## 真实整机一键启动
+
+模拟 MCU 流程通过后，真实电控联调用：
+
+```bash
+./run_competition.sh --dry-run
+# 配好 coordinator.mcu_serial 并连接电控后：
+./run_competition.sh
+# 无桌面/SSH 加 --headless
+```
+
+默认打开 Detection/Mask，自动配置 Maix USB 网络并启动正式协同器。
+串口路径配置、只读预检和 START/READY/扫码顺序见 [整机闭环测试](docs/整机闭环测试.md)。
 
 ## 通信入口
 
-MaixCAM Pro 与下位机协调入口保持不变：
+MaixCAM Pro 当前默认通过 USB 虚拟网卡 TCP 向 Jetson 发送任务码；Jetson 与电控之间使用
+115200、8N1 的双向串口。正式入口：
 
 ```bash
 python3 -m jetson_recognition.run coordinator \
-  --maix-serial /dev/serial/by-id/MAIX_DEVICE \
+  --maix-transport tcp \
+  --maix-tcp-host 0.0.0.0 \
+  --maix-tcp-port 5000 \
   --mcu-serial /dev/serial/by-id/MCU_DEVICE
 ```
 
-颜色结果仍使用既有 `VISION_RESULT`/协调器协议字段，原有颜色编号不变；控制台 JSON 额外提供
-`color`、`center_x`、`center_y` 便于人工排查。
+完整收发字段、CRC、状态机和错误处理见
+[docs/电控对接协议.md](docs/电控对接协议.md)。`VISION_RESULT` 只用于 `live --serial` 单模块
+调试，不是正式整车接口。
 
 ## 验证
 
@@ -98,7 +118,7 @@ python3 -m compileall -q jetson_recognition tools tests
 主要结构保持现状，没有为了形式重写工程：
 
 - `camera.py`：相机和 V4L2；
-- `detectors.py`：HSV、Mask、轮廓、面积、质心；
-- `stability.py`：简单五帧颜色稳定以及旧辅助模式所需稳定窗口；
+- `detectors.py`：HSV、Mask、轮廓凸包、基础几何过滤和质心；
+- `stability.py`：简单帧数+时间稳定门以及旧辅助模式所需稳定窗口；
 - `run.py`：命令行、显示和输出；
 - `output.py` / `coordinator.py`：已有通信协议。

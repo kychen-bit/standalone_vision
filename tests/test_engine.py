@@ -55,6 +55,25 @@ class EngineTests(unittest.TestCase):
         tracker.miss()
         self.assertEqual(tracker.samples, [])
 
+    def test_stability_requires_configured_minimum_time(self):
+        tracker = SimpleColorStability(
+            required_frames=3,
+            max_center_delta_px=5.0,
+            min_duration_ms=250,
+        )
+        self.assertIsNone(
+            tracker.update("COLOR:1", 10, 10, 10, 10, 1.0, timestamp=0.00)
+        )
+        self.assertIsNone(
+            tracker.update("COLOR:1", 10, 10, 10, 10, 1.0, timestamp=0.10)
+        )
+        self.assertIsNone(
+            tracker.update("COLOR:1", 10, 10, 10, 10, 1.0, timestamp=0.20)
+        )
+        self.assertIsNotNone(
+            tracker.update("COLOR:1", 10, 10, 10, 10, 1.0, timestamp=0.26)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

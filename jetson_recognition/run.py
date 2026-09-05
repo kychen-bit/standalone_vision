@@ -781,6 +781,103 @@ def run_bridge(arguments):
     return 0
 
 
+def run_maix_network_receiver(arguments):
+    """Receive and CRC-check Maix QR frames over the USB TCP link."""
+    import socket
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((arguments.host, int(arguments.port)))
+    server.listen(1)
+    print(
+        json.dumps(
+            {
+                "state": "MAIX_TCP_LISTENING",
+                "host": arguments.host,
+                "port": int(arguments.port),
+            }
+        ),
+        flush=True,
+    )
+    try:
+        while True:
+            connection, address = server.accept()
+            print(
+                json.dumps(
+                    {
+                        "state": "MAIX_TCP_CONNECTED",
+                        "peer": "%s:%s" % address,
+                    }
+                ),
+                flush=True,
+            )
+            buffer = b""
+            try:
+                while True:
+                    chunk = connection.recv(1024)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    if len(buffer) > 4096 and b"\n" not in buffer:
+                        print('{"state":"MAIX_TCP_BUFFER_RESET"}', flush=True)
+                        buffer = b""
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        decoded = decode_frame(line)
+                        if decoded is None:
+                            print(
+                                json.dumps(
+                                    {
+                                        "state": "MAIX_TCP_INVALID_FRAME",
+                                        "raw": line.decode("ascii", "replace"),
+                                    }
+                                ),
+                                flush=True,
+                            )
+                            continue
+                        name, fields = decoded
+                        print(
+                            json.dumps(
+                                {
+                                    "state": "MAIX_TCP_FRAME",
+                                    "frame": name,
+                                    "fields": fields,
+                                    "peer": address[0],
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+            except (ConnectionError, OSError) as error:
+                print(
+                    json.dumps(
+                        {
+                            "state": "MAIX_TCP_CONNECTION_ERROR",
+                            "peer": address[0],
+                            "error": str(error),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            finally:
+                connection.close()
+                print(
+                    json.dumps(
+                        {
+                            "state": "MAIX_TCP_DISCONNECTED",
+                            "peer": address[0],
+                        }
+                    ),
+                    flush=True,
+                )
+    except KeyboardInterrupt:
+        print('{"state":"MAIX_TCP_STOPPED"}', flush=True)
+    finally:
+        server.close()
+    return 0
+
+
 def parser():
     root = argparse.ArgumentParser(description="Jetson recognition-only tester (serial is optional)")
     root.add_argument("--config", default="config/jetson.json")
@@ -875,18 +972,42 @@ def parser():
         "--out-serial", help="optional second UART to re-emit raw frames"
     )
     bridge.add_argument("--baud", type=int, default=115200)
+    maix_network = subparsers.add_parser(
+        "maix-net",
+        help="receive MaixCAM Pro QR frames over the USB virtual network",
+    )
+    maix_network.add_argument(
+        "--host", default="0.0.0.0", help="local listen address"
+    )
+    maix_network.add_argument("--port", type=int, default=5000)
     coordinator = subparsers.add_parser(
         "coordinator",
         help="MCU-driven vision service: task code from Maix, results to the MCU",
     )
     coordinator.add_argument(
+        "--maix-transport",
+        choices=("tcp", "serial"),
+        help="Maix input transport; defaults to config coordinator.maix_transport",
+    )
+    coordinator.add_argument(
         "--maix-serial", help="UART receiving Maix frames"
+    )
+    coordinator.add_argument(
+        "--maix-tcp-host", help="local address for the Maix TCP listener"
+    )
+    coordinator.add_argument(
+        "--maix-tcp-port", type=int, help="Maix TCP listener port"
     )
     coordinator.add_argument(
         "--mcu-serial", help="bidirectional UART to the electronics"
     )
     coordinator.add_argument(
         "--camera", help="camera index or /dev/v4l/by-id path"
+    )
+    coordinator.add_argument(
+        "--gui",
+        action="store_true",
+        help="show Detection and Mask windows for coordinator debugging",
     )
     coordinator.add_argument("--baud", type=int, default=115200)
     return root
@@ -906,13 +1027,25 @@ def main():
     cli_parser = parser()
     arguments = cli_parser.parse_args()
     if arguments.source is None:
-        cli_parser.error("choose one test source: live, image, pickup or bridge")
+        cli_parser.error(
+            "choose one test source: live, image, pickup, bridge, maix-net or coordinator"
+        )
     config = load_config(arguments.config)
     if arguments.source == "bridge":
         raise SystemExit(run_bridge(arguments))
+    if arguments.source == "maix-net":
+        raise SystemExit(run_maix_network_receiver(arguments))
     engine = build_engine(config)
     if arguments.source == "coordinator":
-        raise SystemExit(run_coordinator(arguments, config, engine, PROJECT_ROOT))
+        raise SystemExit(
+            run_coordinator(
+                arguments,
+                config,
+                engine,
+                PROJECT_ROOT,
+                draw_result_fn=draw_result,
+            )
+        )
     serial_device, serial_baud = resolve_serial(arguments, config)
     color_names = {
         str(color_id): definition["name"]

@@ -4,7 +4,7 @@ Navigation, obstacle avoidance and gripper motion belong to the electronics
 (MCU). This module provides everything recognition-related and the
 communication glue:
 
-- receives the task code from MaixCAM Pro (UART A, ``@MAIX_QR`` frames);
+- receives the task code from MaixCAM Pro (TCP or UART, ``@MAIX_QR`` frames);
 - answers MCU requests (``REQ PICK / PLACE / STACK``) with recognition;
 - emits ``GRASP_READY`` / ``ALIGN_READY`` with coordinates after the simple
   recognition session becomes stable; navigation and motion remain MCU-owned;
@@ -61,6 +61,11 @@ class VisionCoordinator:
         self.target_from_queue = False
         self.grant_deadline = None
         self.grant_misses = 0
+        # Latest per-frame result is retained only for the optional coordinator
+        # GUI. It does not participate in protocol decisions.
+        self.last_measurement = None
+        self.last_stable = None
+        self.last_count = 0
         self.outbox = []
 
     # -- output -------------------------------------------------------------
@@ -83,14 +88,20 @@ class VisionCoordinator:
     # -- task code ----------------------------------------------------------
     def accept_task_code(self, payload):
         """Store the parsed task plan and report it to the MCU."""
+        payload = str(payload).strip()
+        # One START represents one competition run. Once its first valid QR is
+        # accepted, a reconnect or a second visible QR must not replace it.
+        # ABORT + START is the explicit way to request a fresh scan.
+        if self.task_raw is not None:
+            return "DUPLICATE" if payload == self.task_raw else "LOCKED"
         if self.state not in ("WAIT_TASK", "TASK_READY"):
             self._error("NONE", "BAD_STATE", self.state)
-            return
+            return "BAD_STATE"
         try:
             plan = decode_task_code(payload)
         except ValueError:
             self._error("NONE", "BAD_TASK_CODE")
-            return
+            return "INVALID"
         self.queue = flat_color_plan(payload)
         self.queue_index = 0
         self.task_raw = plan["raw"]
@@ -99,6 +110,7 @@ class VisionCoordinator:
         # in one field is forbidden by protocol._field and used to crash the
         # real serial writer even though the coordinator unit test passed.
         self._emit("TASK_PLAN", self.task_raw, *self.queue)
+        return "ACCEPTED"
 
     def _peek_queue_color(self):
         if self.queue_index >= len(self.queue):
@@ -186,6 +198,9 @@ class VisionCoordinator:
         self.target_from_queue = target_from_queue
         self.grant_deadline = None
         self.grant_misses = 0
+        self.last_measurement = None
+        self.last_stable = None
+        self.last_count = 0
         self.state = "BUSY"
         self._emit("ACCEPTED", seq, kind)
 
@@ -245,9 +260,15 @@ class VisionCoordinator:
         self.report_counter = 0
         self.grant_deadline = None
         self.grant_misses = 0
+        self.last_measurement = None
+        self.last_stable = None
+        self.last_count = 0
         self._restart_session()
 
     def _restart_session(self):
+        self.last_measurement = None
+        self.last_stable = None
+        self.last_count = 0
         if self.kind == "PICK":
             self.session = self.engine.new_session("COLOR", (self.target, self.zone))
         elif self.kind == "PLACE":
@@ -279,6 +300,9 @@ class VisionCoordinator:
         self.target_from_queue = False
         self.grant_deadline = None
         self.grant_misses = 0
+        self.last_measurement = None
+        self.last_stable = None
+        self.last_count = 0
 
     # -- per-frame update ---------------------------------------------------
     def update(self, frame, now_s=None):
@@ -297,7 +321,7 @@ class VisionCoordinator:
             if self.grant_deadline is not None and now_s > self.grant_deadline:
                 self._revoke_grasp("EXPIRED")
                 return
-            self._monitor_grasp(frame)
+            self._monitor_grasp(frame, now_s)
             return
         if self.state != "BUSY":
             return
@@ -311,8 +335,11 @@ class VisionCoordinator:
         if self.session is not None:
             self._update_session(frame, now_s)
 
-    def _monitor_grasp(self, frame):
-        measurement, stable, _count = self.session.update(frame)
+    def _monitor_grasp(self, frame, now_s):
+        measurement, stable, count = self.session.update(frame, now_s)
+        self.last_measurement = measurement
+        self.last_stable = stable
+        self.last_count = count
         if measurement is None:
             self.grant_misses += 1
             if self.grant_misses >= self.revoke_after_misses:
@@ -323,10 +350,13 @@ class VisionCoordinator:
             self._revoke_grasp("UNSTABLE")
 
     def _update_session(self, frame, now_s):
-        result = self.session.update(frame)
+        result = self.session.update(frame, now_s)
         if result is None:
             return
         measurement, stable, count = result
+        self.last_measurement = measurement
+        self.last_stable = stable
+        self.last_count = count
         if measurement is not None and self.target_report_every > 0:
             self.report_counter += 1
             if self.report_counter % self.target_report_every == 0:
@@ -347,20 +377,35 @@ class VisionCoordinator:
                 )
         if measurement is None or stable is None:
             return
+        stable_x, stable_y, stable_yaw, stable_confidence, stable_count = stable
         if self.kind == "PICK":
-            px = measurement.pixel_x if measurement.pixel_x is not None else measurement.x
-            py = measurement.pixel_y if measurement.pixel_y is not None else measurement.y
+            # Send the stable-window aggregate, not the possibly noisy final
+            # frame. With the current PX calibration these are also pixel
+            # coordinates; metric calibration keeps the latest raw pixel pair.
+            if measurement.unit == "PX":
+                px, py = stable_x, stable_y
+            else:
+                px = (
+                    measurement.pixel_x
+                    if measurement.pixel_x is not None
+                    else measurement.x
+                )
+                py = (
+                    measurement.pixel_y
+                    if measurement.pixel_y is not None
+                    else measurement.y
+                )
             self._emit(
                 "GRASP_READY",
                 self.seq,
                 self.target,
-                "%.3f" % measurement.x,
-                "%.3f" % measurement.y,
+                "%.3f" % stable_x,
+                "%.3f" % stable_y,
                 measurement.unit,
                 "%.3f" % px,
                 "%.3f" % py,
-                "%.3f" % measurement.confidence,
-                count,
+                "%.3f" % stable_confidence,
+                stable_count,
                 self.result_valid_ms,
             )
             if self.require_exec_ack:
@@ -377,32 +422,34 @@ class VisionCoordinator:
             self.seq,
             self.kind,
             self.target,
-            "%.3f" % measurement.x,
-            "%.3f" % measurement.y,
-            "%.3f" % measurement.yaw,
+            "%.3f" % stable_x,
+            "%.3f" % stable_y,
+            "%.3f" % stable_yaw,
             measurement.unit,
-            "%.3f" % measurement.confidence,
-            count,
+            "%.3f" % stable_confidence,
+            stable_count,
         )
         self.state = "WAIT_DONE"
         self.session = None
         self.deadline = None
 
 
-class FrameReader:
-    """Read and CRC-check frames from a pyserial port."""
+class FrameBuffer:
+    """Incrementally split and CRC-check newline-delimited protocol frames."""
 
-    def __init__(self, port):
+    def __init__(self, max_bytes=4096):
         from .protocol import decode_frame
 
-        self.port = port
         self.buffer = b""
+        self.max_bytes = max(256, int(max_bytes))
         self._decode = decode_frame
 
-    def read_frames(self):
-        chunk = self.port.read(256)
+    def feed(self, chunk):
         if chunk:
             self.buffer += chunk
+        if len(self.buffer) > self.max_bytes and b"\n" not in self.buffer:
+            self.buffer = b""
+            return []
         frames = []
         while b"\n" in self.buffer:
             line, self.buffer = self.buffer.split(b"\n", 1)
@@ -412,46 +459,259 @@ class FrameReader:
         return frames
 
 
-def run_coordinator(arguments, config, engine, project_root):
-    """IO adapter: Maix UART (in), MCU UART (bidirectional), camera."""
+class FrameReader:
+    """Read and CRC-check frames from a non-blocking pyserial port."""
+
+    def __init__(self, port):
+        self.port = port
+        self.decoder = FrameBuffer()
+
+    def read_frames(self):
+        return self.decoder.feed(self.port.read(256))
+
+
+class TcpFrameServer:
+    """Non-blocking single-client TCP input for Maix protocol frames."""
+
+    def __init__(self, host, port):
+        import socket
+
+        self.host = str(host)
+        self.port = int(port)
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind((self.host, self.port))
+        self.server.listen(1)
+        self.server.setblocking(False)
+        self.connection = None
+        self.peer = None
+        self.decoder = FrameBuffer()
+        print(
+            json.dumps(
+                {
+                    "state": "MAIX_TCP_LISTENING",
+                    "host": self.host,
+                    "port": self.port,
+                }
+            ),
+            flush=True,
+        )
+
+    def _disconnect(self, reason=None):
+        peer = self.peer
+        if self.connection is not None:
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+        self.connection = None
+        self.peer = None
+        self.decoder = FrameBuffer()
+        if peer is not None:
+            message = {"state": "MAIX_TCP_DISCONNECTED", "peer": peer[0]}
+            if reason:
+                message["reason"] = str(reason)
+            print(json.dumps(message, ensure_ascii=False), flush=True)
+
+    def _accept_if_ready(self):
+        if self.connection is not None:
+            return
+        try:
+            connection, peer = self.server.accept()
+        except BlockingIOError:
+            return
+        connection.setblocking(False)
+        self.connection = connection
+        self.peer = peer
+        self.decoder = FrameBuffer()
+        print(
+            json.dumps(
+                {
+                    "state": "MAIX_TCP_CONNECTED",
+                    "peer": "%s:%s" % peer,
+                }
+            ),
+            flush=True,
+        )
+
+    def read_frames(self):
+        self._accept_if_ready()
+        if self.connection is None:
+            return []
+        frames = []
+        while True:
+            try:
+                chunk = self.connection.recv(1024)
+            except BlockingIOError:
+                break
+            except (ConnectionError, OSError) as error:
+                self._disconnect(error)
+                break
+            if not chunk:
+                self._disconnect()
+                break
+            frames.extend(self.decoder.feed(chunk))
+        return frames
+
+    def close(self):
+        self._disconnect()
+        self.server.close()
+
+
+def run_coordinator(arguments, config, engine, project_root, draw_result_fn=None):
+    """IO adapter: Maix TCP/UART input, MCU UART, and camera."""
+    import cv2
     import serial
 
     from .camera import UVCCamera
     from .protocol import encode_frame
 
     coord = config.get("coordinator", {})
+    maix_transport = str(
+        getattr(arguments, "maix_transport", None)
+        or coord.get("maix_transport", "serial")
+    ).lower()
     maix_device = arguments.maix_serial or coord.get("maix_serial")
+    maix_host = (
+        getattr(arguments, "maix_tcp_host", None)
+        or coord.get("maix_tcp_host", "0.0.0.0")
+    )
+    maix_port = int(
+        getattr(arguments, "maix_tcp_port", None)
+        or coord.get("maix_tcp_port", 5000)
+    )
     mcu_device = arguments.mcu_serial or coord.get("mcu_serial")
     baud = int(coord.get("baud", arguments.baud))
-    if not maix_device or not mcu_device:
+    if maix_transport not in ("tcp", "serial"):
+        raise SystemExit("coordinator maix_transport must be tcp or serial")
+    if not mcu_device or (maix_transport == "serial" and not maix_device):
         raise SystemExit(
-            "coordinator needs maix_serial and mcu_serial "
-            "(config coordinator.maix_serial / mcu_serial or --maix-serial / --mcu-serial)"
+            "coordinator needs mcu_serial and, for serial Maix input, maix_serial"
         )
     # Both readers are polled in the same camera loop. Blocking timeouts here
     # used to stall recognition by up to 0.4 s per iteration.
-    maix = serial.Serial(maix_device, baudrate=baud, timeout=0)
+    if maix_transport == "tcp":
+        maix = TcpFrameServer(maix_host, maix_port)
+        maix_reader = maix
+        maix_label = "%s:%d" % (maix_host, maix_port)
+    else:
+        maix = serial.Serial(maix_device, baudrate=baud, timeout=0)
+        maix_reader = FrameReader(maix)
+        maix_label = maix_device
     mcu = serial.Serial(mcu_device, baudrate=baud, timeout=0, write_timeout=0.2)
     camera = UVCCamera(config["camera"], project_root, arguments.camera)
     coordinator = VisionCoordinator(engine, coord)
-    maix_reader = FrameReader(maix)
     mcu_reader = FrameReader(mcu)
+    gui_enabled = bool(getattr(arguments, "gui", False))
+    if gui_enabled and draw_result_fn is None:
+        raise SystemExit("coordinator GUI drawing function is unavailable")
+    if gui_enabled:
+        engine.detector.set_color_debug(True)
+        engine.detector.set_circle_debug(True)
+        cv2.namedWindow("Detection", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Mask", cv2.WINDOW_NORMAL)
     print(
-        '{"state":"COORDINATOR_READY","maix":"%s","mcu":"%s"}'
-        % (maix_device, mcu_device),
+        json.dumps(
+            {
+                "state": "COORDINATOR_READY",
+                "maix_transport": maix_transport,
+                "maix": maix_label,
+                "mcu": mcu_device,
+            }
+        ),
         flush=True,
     )
     try:
         while True:
             now_s = time.monotonic()
-            for name, fields in maix_reader.read_frames():
-                if name == "MAIX_QR" and fields:
-                    coordinator.accept_task_code(fields[0])
+            # Apply MCU control state first. If START and a queued TCP QR arrive
+            # in the same loop, START must establish WAIT_TASK before MAIX_QR.
             for name, fields in mcu_reader.read_frames():
                 coordinator.on_mcu_frame(name, fields)
+            for name, fields in maix_reader.read_frames():
+                if name == "MAIX_QR" and fields:
+                    task_status = coordinator.accept_task_code(fields[0])
+                    if task_status in ("DUPLICATE", "LOCKED"):
+                        print(
+                            json.dumps(
+                                {
+                                    "state": "MAIX_TASK_CODE_IGNORED",
+                                    "reason": task_status,
+                                    "received": fields[0],
+                                    "active": coordinator.task_raw,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
             frame = camera.read()
             if frame is not None:
                 coordinator.update(frame, now_s)
+                if gui_enabled:
+                    if coordinator.kind in ("PICK", "STACK"):
+                        color_debug = engine.detector.last_color_debug
+                        circle_debug = None
+                    elif coordinator.kind == "PLACE":
+                        color_debug = None
+                        circle_debug = engine.detector.last_circle_debug
+                    else:
+                        color_debug = None
+                        circle_debug = None
+
+                    if coordinator.last_stable is not None:
+                        recognition_state = "STABLE"
+                    elif coordinator.last_measurement is not None:
+                        recognition_state = "UNSTABLE"
+                    elif coordinator.state == "BUSY":
+                        recognition_state = "LOST"
+                    else:
+                        recognition_state = "IDLE"
+                    display_state = "%s/%s" % (
+                        coordinator.state,
+                        recognition_state,
+                    )
+                    canvas = draw_result_fn(
+                        frame,
+                        coordinator.last_measurement,
+                        display_state,
+                        coordinator.last_count,
+                        color_debug,
+                        circle_debug,
+                        draw_search_roi=True,
+                    )
+                    if coordinator.target is not None:
+                        cv2.putText(
+                            canvas,
+                            "request=%s seq=%s target=%s zone=%s"
+                            % (
+                                coordinator.kind,
+                                coordinator.seq,
+                                coordinator.target,
+                                coordinator.zone,
+                            ),
+                            (10, 62),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (255, 255, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                    cv2.imshow("Detection", canvas)
+
+                    mask = None
+                    if color_debug is not None:
+                        mask = color_debug.get("mask")
+                    elif circle_debug is not None:
+                        mask = circle_debug.get("processed")
+                    if mask is None:
+                        mask = frame[:, :, 0] * 0
+                    cv2.imshow("Mask", mask)
+                    if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                        print(
+                            json.dumps({"state": "COORDINATOR_GUI_STOPPED"}),
+                            flush=True,
+                        )
+                        break
             for name, fields in coordinator.drain():
                 try:
                     mcu.write(encode_frame(name, *fields))
@@ -468,6 +728,8 @@ def run_coordinator(arguments, config, engine, project_root):
                     )
             time.sleep(0.005)
     finally:
+        if gui_enabled:
+            cv2.destroyAllWindows()
         camera.close()
         maix.close()
         mcu.close()

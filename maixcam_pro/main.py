@@ -2,6 +2,9 @@
 
 from maix import app, camera, display, image, pinmap, uart
 
+import socket
+import time
+
 import config
 
 
@@ -73,6 +76,96 @@ def open_serial_if_enabled():
     return uart.UART(config.UART_DEVICE, config.UART_BAUD)
 
 
+class TcpFrameSender:
+    """Small reconnecting TCP client; recognition continues while disconnected."""
+
+    def __init__(
+        self,
+        host,
+        port,
+        timeout_s=1.0,
+        retry_interval_s=1.0,
+        heartbeat_interval_s=2.0,
+    ):
+        self.address = (str(host), int(port))
+        self.timeout_s = float(timeout_s)
+        self.retry_interval_s = float(retry_interval_s)
+        self.heartbeat_interval_s = float(heartbeat_interval_s)
+        self.socket = None
+        self.next_retry_s = 0.0
+        self.next_heartbeat_s = 0.0
+        self.connection_generation = 0
+
+    def close(self):
+        if self.socket is not None:
+            try:
+                self.socket.close()
+            except Exception:
+                pass
+            self.socket = None
+
+    def _connect(self):
+        now_s = time.monotonic()
+        if now_s < self.next_retry_s:
+            return False
+        self.close()
+        try:
+            connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            connection.settimeout(self.timeout_s)
+            connection.connect(self.address)
+            self.socket = connection
+            self.connection_generation += 1
+            self.next_heartbeat_s = now_s + self.heartbeat_interval_s
+            print(
+                "TCP_CONNECTED host=%s port=%d"
+                % (self.address[0], self.address[1])
+            )
+            return True
+        except Exception as error:
+            self.close()
+            self.next_retry_s = now_s + self.retry_interval_s
+            print("TCP_CONNECT_FAILED error=%s" % error)
+            return False
+
+    def write(self, data):
+        if self.socket is None and not self._connect():
+            return False
+        try:
+            self.socket.sendall(data)
+            return True
+        except Exception as error:
+            print("TCP_SEND_FAILED error=%s" % error)
+            self.close()
+            self.next_retry_s = time.monotonic() + self.retry_interval_s
+            return False
+
+    def maintain(self):
+        """Reconnect while idle and use a low-rate frame to detect stale sockets."""
+        now_s = time.monotonic()
+        if self.socket is None:
+            return self._connect()
+        if now_s < self.next_heartbeat_s:
+            return True
+        self.next_heartbeat_s = now_s + self.heartbeat_interval_s
+        return self.write(encode_frame("MAIX_HEARTBEAT"))
+
+
+def open_tcp_if_enabled():
+    if not getattr(config, "TCP_ENABLED", False):
+        return None
+    sender = TcpFrameSender(
+        config.TCP_SERVER_HOST,
+        config.TCP_SERVER_PORT,
+        getattr(config, "TCP_CONNECT_TIMEOUT_S", 1.0),
+        getattr(config, "TCP_RETRY_INTERVAL_S", 1.0),
+        getattr(config, "TCP_HEARTBEAT_INTERVAL_S", 2.0),
+    )
+    # Connect once at startup so the Jetson can verify the link before a QR is
+    # shown. A failure is non-fatal; write() keeps retrying in the background.
+    sender._connect()
+    return sender
+
+
 def main():
     cam = camera.Camera(config.CAMERA_WIDTH, config.CAMERA_HEIGHT, fps=config.CAMERA_FPS)
     detector_mode = getattr(config, "QR_DETECTOR_MODE", "cpu").lower()
@@ -83,14 +176,22 @@ def main():
         detector = None  # 使用 img.find_qrcodes()（CPU，兼容老固件）
     screen = display.Display() if config.DISPLAY_ENABLED else None
     serial_port = open_serial_if_enabled()
+    tcp_sender = open_tcp_if_enabled()
     last_payload = ""
     confirmed = 0
     missed = 0
     emitted_payload = ""
+    emitted_connection_generation = 0
 
     print(
-        "MAIX_STANDALONE_QR_READY serial=%s detector_mode=%s"
-        % (bool(serial_port), detector_mode)
+        "MAIX_STANDALONE_QR_READY serial=%s tcp=%s tcp_server=%s:%s detector_mode=%s"
+        % (
+            bool(serial_port),
+            bool(tcp_sender),
+            getattr(config, "TCP_SERVER_HOST", "-"),
+            getattr(config, "TCP_SERVER_PORT", "-"),
+            detector_mode,
+        )
     )
     frame_number = 0
     log_every = int(getattr(config, "DEBUG_LOG_EVERY_FRAMES", 30))
@@ -100,6 +201,8 @@ def main():
             print("CAMERA_EMPTY")
             continue
         frame_number += 1
+        if tcp_sender is not None:
+            tcp_sender.maintain()
 
         valid_qr = None
         invalid_qr = None
@@ -165,30 +268,48 @@ def main():
             if getattr(config, "DRAW_BOX", True):
                 frame.draw_rect(min_x, min_y, max_x - min_x, max_y - min_y, color, thickness=3)
             frame.draw_string(10, 10, "%s %d/%d" % (payload, confirmed, config.CONFIRM_FRAMES), color, scale=2)
-            if stable and payload != emitted_payload:
-                emitted_payload = payload
-                print(
-                    "QR_STABLE payload=%s x=%.1f y=%.1f side=%.1f" % (
-                        payload,
-                        center_x,
-                        center_y,
-                        side,
-                    )
-                )
-                if serial_port is not None:
-                    serial_port.write(
-                        encode_frame(
-                            "MAIX_QR",
+            connection_changed = (
+                tcp_sender is not None
+                and tcp_sender.connection_generation != emitted_connection_generation
+            )
+            if stable and (payload != emitted_payload or connection_changed):
+                if confirmed == config.CONFIRM_FRAMES:
+                    print(
+                        "QR_STABLE payload=%s x=%.1f y=%.1f side=%.1f" % (
                             payload,
-                            "%.1f" % center_x,
-                            "%.1f" % center_y,
-                            "%.1f" % side,
-                            confirmed,
-                            "STABLE",
+                            center_x,
+                            center_y,
+                            side,
                         )
                     )
+                output_frame = encode_frame(
+                    "MAIX_QR",
+                    payload,
+                    "%.1f" % center_x,
+                    "%.1f" % center_y,
+                    "%.1f" % side,
+                    confirmed,
+                    "STABLE",
+                )
+                delivered = serial_port is None and tcp_sender is None
+                if serial_port is not None:
+                    try:
+                        serial_port.write(output_frame)
+                        delivered = True
+                    except Exception as error:
+                        print("UART_SEND_FAILED error=%s" % error)
+                if tcp_sender is not None and tcp_sender.write(output_frame):
+                    delivered = True
+                if delivered:
+                    emitted_payload = payload
+                    if tcp_sender is not None:
+                        emitted_connection_generation = tcp_sender.connection_generation
+                    print("QR_SENT payload=%s" % payload)
         if screen is not None:
             screen.show(frame)
+
+    if tcp_sender is not None:
+        tcp_sender.close()
 
 
 if __name__ == "__main__":

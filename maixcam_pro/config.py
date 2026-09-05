@@ -22,3 +22,12 @@ UART_DEVICE = "/dev/ttyS1"
 UART_BAUD = 115200
 UART_TX_PIN = "A19"
 UART_RX_PIN = "A18"
+
+# USB virtual network (MaixCAM Pro 10.33.117.1 -> Jetson RNDIS interface).
+# Jetson's maixcam-usb-static NetworkManager profile fixes this address.
+TCP_ENABLED = True
+TCP_SERVER_HOST = "10.33.117.105"
+TCP_SERVER_PORT = 5000
+TCP_CONNECT_TIMEOUT_S = 1.0
+TCP_RETRY_INTERVAL_S = 1.0
+TCP_HEARTBEAT_INTERVAL_S = 2.0

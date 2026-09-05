@@ -1,5 +1,7 @@
 """Recognition orchestration with no camera or serial dependency."""
 
+import time
+
 from .model import Measurement
 from .stability import SimpleColorStability, StableWindow
 
@@ -67,7 +69,8 @@ class RecognitionSession:
         self.window = None
         self.unit = None
 
-    def update(self, frame):
+    def update(self, frame, timestamp=None):
+        timestamp = time.monotonic() if timestamp is None else float(timestamp)
         measurement = self.engine.detect(frame, self.mode, self.args)
         if measurement is None:
             if self.window is not None:
@@ -81,6 +84,7 @@ class RecognitionSession:
                 self.window = SimpleColorStability(
                     required_frames=stability.get("stable_frames", 3),
                     max_center_delta_px=stability.get("max_center_delta_px", 6.0),
+                    min_duration_ms=stability.get("min_stable_time_ms", 0),
                 )
             stable = self.window.update(
                 measurement.kind + ":" + measurement.target_id,
@@ -89,6 +93,7 @@ class RecognitionSession:
                 measurement.x,
                 measurement.y,
                 measurement.confidence,
+                timestamp,
             )
             if stable is not None and hasattr(
                 self.engine.detector, "activate_dynamic_roi"
@@ -125,6 +130,9 @@ class RecognitionSession:
                         "reset_after_misses", runtime["reset_after_misses"]
                     )
                 )
+                minimum_duration_ms = float(
+                    stability.get("min_stable_time_ms", 0)
+                )
             else:
                 spread = (
                     runtime["stable_spread_mm"]
@@ -134,12 +142,16 @@ class RecognitionSession:
                 required_frames = runtime["stable_frames"]
                 minimum_quality = runtime["min_confidence"]
                 reset_after_misses = runtime["reset_after_misses"]
+                minimum_duration_ms = float(
+                    runtime.get("min_stable_time_ms", 0)
+                )
             self.window = StableWindow(
                 required_frames=required_frames,
                 max_spread_xy=spread,
                 max_spread_yaw=runtime["stable_yaw_deg"],
                 min_quality=minimum_quality,
                 reset_after_misses=reset_after_misses,
+                min_duration_ms=minimum_duration_ms,
             )
         stable = self.window.update(
             measurement.kind + ":" + measurement.target_id,
@@ -147,6 +159,7 @@ class RecognitionSession:
             measurement.y,
             measurement.yaw,
             measurement.confidence,
+            timestamp,
         )
         return measurement, stable, len(self.window.samples)
 

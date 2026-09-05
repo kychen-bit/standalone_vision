@@ -1,4 +1,4 @@
-"""Run a camera/serial-free MCU -> color recognition -> DONE protocol loop."""
+"""Run an MCU -> requested ring digit -> ALIGN_READY -> DONE CRC loop."""
 
 import json
 from pathlib import Path
@@ -18,6 +18,26 @@ from jetson_recognition.run import build_engine, load_config
 
 
 TASK_CODE = "156+123+516+231"
+
+
+def draw_numbered_ring(frame, center, digit):
+    cv2.circle(frame, center, 55, (20, 20, 20), 8, cv2.LINE_AA)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 1.5
+    thickness = 4
+    (width, height), _baseline = cv2.getTextSize(
+        str(digit), font, scale, thickness
+    )
+    cv2.putText(
+        frame,
+        str(digit),
+        (center[0] - width // 2, center[1] + height // 2),
+        font,
+        scale,
+        (20, 20, 20),
+        thickness,
+        cv2.LINE_AA,
+    )
 
 
 def run_simulation(emit=True):
@@ -45,73 +65,77 @@ def run_simulation(emit=True):
         decoded = record("MCU_TO_JETSON", encode_frame(name, *fields))
         coordinator.on_mcu_frame(*decoded)
 
-    def maix_send(name, *fields):
-        decoded = record("MAIX_TO_JETSON", encode_frame(name, *fields))
-        if decoded[0] != "MAIX_QR" or not decoded[1]:
-            raise RuntimeError("unexpected simulated Maix frame")
-        coordinator.accept_task_code(decoded[1][0])
-
     def receive_all():
         for name, fields in coordinator.drain():
             record("JETSON_TO_MCU", encode_frame(name, *fields))
 
-    frame = np.zeros(
+    frame = np.full(
         (int(config["camera"]["height"]), int(config["camera"]["width"]), 3),
+        200,
         dtype=np.uint8,
     )
-    # A synthetic red material fully inside the configured TURNTABLE ROI.
-    cv2.rectangle(frame, (520, 300), (660, 440), (0, 0, 255), -1)
+    # Deliberately swap positions: the requested digit 2 is on the right.
+    draw_numbered_ring(frame, (280, 370), "3")
+    draw_numbered_ring(frame, (640, 370), "1")
+    draw_numbered_ring(frame, (1000, 370), "2")
 
-    mcu_send("START", "SIM_RUN")
+    mcu_send("START", "SIM_RING_RUN")
     receive_all()
-    maix_send("MAIX_QR", TASK_CODE, "320", "240", "120", "5", "STABLE")
+    coordinator.accept_task_code(TASK_CODE)
     receive_all()
-    mcu_send("REQ", "SIM001", "PICK", "TURNTABLE", "1")
+    mcu_send("REQ", "RING001", "PLACE", "ROUGH", "2")
     receive_all()
 
-    stable_frames = int(config["stability"]["stable_frames"])
+    stable_frames = int(
+        config["ring_detection"]["stability"]["stable_frames"]
+    )
     duration_frames = int(
-        float(config["stability"].get("min_stable_time_ms", 0)) // 20.0
+        float(
+            config["ring_detection"]["stability"].get(
+                "min_stable_time_ms", 0
+            )
+        )
+        // 20.0
     ) + 2
     update_count = max(stable_frames, duration_frames)
     for index in range(update_count):
         coordinator.update(frame, index * 0.02)
         receive_all()
 
-    mcu_send("EXEC", "SIM001")
-    receive_all()
-    mcu_send("DONE", "SIM001", "OK")
+    mcu_send("DONE", "RING001", "OK")
     receive_all()
 
     outbound = [
-        item["name"]
-        for item in transcript
-        if item["direction"] == "JETSON_TO_MCU"
+        item for item in transcript if item["direction"] == "JETSON_TO_MCU"
     ]
-    expected = [
-        "READY",
-        "TASK_PLAN",
-        "ACCEPTED",
-        "GRASP_READY",
-        "EXEC_ACK",
-        "DONE_ACK",
-    ]
-    if outbound != expected or coordinator.state != "TASK_READY":
+    names = [item["name"] for item in outbound]
+    expected = ["READY", "TASK_PLAN", "ACCEPTED", "ALIGN_READY", "DONE_ACK"]
+    alignment = next(
+        (item for item in outbound if item["name"] == "ALIGN_READY"), None
+    )
+    if (
+        names != expected
+        or alignment is None
+        or alignment["fields"][2] != "2"
+        or abs(float(alignment["fields"][3]) - 1000.0) > 3.0
+        or coordinator.state != "TASK_READY"
+    ):
         raise RuntimeError(
-            "closed loop failed: outbound=%r state=%s"
-            % (outbound, coordinator.state)
+            "ring loop failed: outbound=%r alignment=%r state=%s"
+            % (names, alignment, coordinator.state)
         )
     if emit:
         print(
             json.dumps(
                 {
-                    "state": "SIMULATION_OK",
+                    "state": "RING_SIMULATION_OK",
+                    "requested_ring_id": "2",
+                    "detected_center_x": float(alignment["fields"][3]),
                     "required_stable_frames": stable_frames,
-                    "min_stable_time_ms": config["stability"].get(
-                        "min_stable_time_ms", 0
-                    ),
+                    "min_stable_time_ms": config["ring_detection"][
+                        "stability"
+                    ].get("min_stable_time_ms", 0),
                     "coordinator_state": coordinator.state,
-                    "outbound": outbound,
                 },
                 ensure_ascii=False,
             ),

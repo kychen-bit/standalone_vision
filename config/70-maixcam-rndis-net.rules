@@ -1,0 +1,4 @@
+# Give only the Sipeed MaixCAM RNDIS function a stable host-side name.
+# The same USB device also exposes another Ethernet function; matching the
+# driver prevents that 10.33.116.x interface from being renamed.
+ACTION=="add", SUBSYSTEM=="net", ATTRS{idVendor}=="359f", ATTRS{idProduct}=="2120", DRIVERS=="rndis_host", NAME:="maixcam0"
