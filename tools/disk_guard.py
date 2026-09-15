@@ -18,14 +18,58 @@ import argparse
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import time
 
 DEFAULT_STATE = Path("/tmp/standalone-vision-disk-guard.json")
 UVCDYNCTRL_LOG = Path("/var/log/uvcdynctrl-udev.log")
+# The udev helper itself; debug=0 makes it write to /dev/null instead.
+UVCDYNCTRL_HELPER = Path("/lib/udev/uvcdynctrl")
+LOGROTATE_CONFIG = Path("/etc/logrotate.d/uvcdynctrl-udev")
+DISK_GUARD_TIMER = "disk-guard.timer"
 
 # A vision run opens the camera once per process and re-plugging produces a few
 # KB. Anything above this is a storm, not normal hot-plug traffic.
 STORM_FIRINGS_PER_HOUR = 120.0
+
+
+def _helper_debug_value(path=UVCDYNCTRL_HELPER):
+    """Return the helper's debug switch, which decides where it logs."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("debug="):
+                    return line.partition("=")[2].strip()
+    except OSError:
+        return None
+    return None
+
+
+def _systemctl(verb, unit):
+    try:
+        completed = subprocess.run(
+            ["systemctl", verb, unit],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return (completed.stdout or completed.stderr).strip() or "unknown"
+
+
+def guard_state():
+    """Report whether the protections from install_log_guard.sh are in place."""
+    debug = _helper_debug_value()
+    logrotate_installed = shutil.which("logrotate") is not None
+    timer_active = _systemctl("is-active", DISK_GUARD_TIMER)
+    return {
+        "uvcdynctrl_debug": debug,
+        "uvcdynctrl_log_disabled": debug == "0",
+        "logrotate_installed": logrotate_installed,
+        "logrotate_config": LOGROTATE_CONFIG.exists(),
+        "disk_guard_timer_active": timer_active,
+        "disk_guard_timer_enabled": _systemctl("is-enabled", DISK_GUARD_TIMER),
+    }
 
 
 def _read_state(path):
@@ -90,6 +134,30 @@ def sample(path=UVCDYNCTRL_LOG, root="/", state_path=DEFAULT_STATE,
 
     findings = []
     severity = 0
+    guard = guard_state()
+    if not guard["uvcdynctrl_log_disabled"]:
+        severity = max(severity, 1)
+        findings.append(
+            "the UVC udev helper still logs (debug=%s); the log grows on every "
+            "video4linux add event - run: sudo bash tools/install_log_guard.sh"
+            % guard["uvcdynctrl_debug"]
+        )
+    timer_state = guard["disk_guard_timer_active"]
+    if timer_state not in ("active", "unknown"):
+        severity = max(severity, 1)
+        findings.append(
+            "disk-guard timer is %s: nothing truncates the log automatically. "
+            "The udev helper itself is %s, so this is hardening only - run: "
+            "sudo bash tools/install_log_guard.sh"
+            % (timer_state,
+               "already silenced (debug=0)" if guard["uvcdynctrl_log_disabled"]
+               else "still logging")
+        )
+    if not (guard["logrotate_installed"] and guard["logrotate_config"]):
+        # Not a finding: with debug=0 there is nothing left to rotate, and the
+        # timer truncates as a fallback. Reported in "guard" for visibility.
+        pass
+
     if percent >= critical_percent:
         severity = 2
         findings.append("filesystem %s is %.1f%% full" % (root, percent))
@@ -113,6 +181,7 @@ def sample(path=UVCDYNCTRL_LOG, root="/", state_path=DEFAULT_STATE,
     report = {
         "state": "DISK_GUARD",
         "severity": ["ok", "warning", "critical"][severity],
+        "guard": guard,
         "filesystem": {"root": root, "percent": round(percent, 1),
                        "used_bytes": usage.used, "free_bytes": usage.free},
         "uvcdynctrl_log": {
