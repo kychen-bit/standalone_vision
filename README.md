@@ -90,6 +90,7 @@ Jetson 默认通过 `gstreamer_nv` 对 USB 相机 MJPEG 做硬件解码；识别
 
 默认打开 Detection/Mask，自动配置 Maix USB 网络并启动正式协同器。
 串口路径配置、只读预检和 START/READY/扫码顺序见 [整机闭环测试](docs/整机闭环测试.md)。
+没有完整实机时，通过 Keil Watch 逐阶段验证协议见 [电控 Watch 手动联调流程](docs/电控Watch手动联调.md)。
 
 ## 通信入口
 
