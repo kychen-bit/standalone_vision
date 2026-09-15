@@ -188,9 +188,12 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(result.target_id, "1")
         self.assertAlmostEqual(result.pixel_x, 960.0, delta=2.0)
         self.assertAlmostEqual(result.pixel_y, 360.0, delta=2.0)
+        # Tracks config/jetson.json scenes.STORAGE.object_roi, which is now the
+        # full frame; the ring 1 legacy box [160, 250, 240, 240] must still be
+        # ignored for STACK.
         self.assertEqual(
             detector.last_color_runtime["base_roi"],
-            [80, 170, 1120, 430],
+            [0, 0, 1280, 720],
         )
 
     def test_black_uses_value_not_hue(self):

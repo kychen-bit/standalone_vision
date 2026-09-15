@@ -34,7 +34,7 @@
         "auto_exposure": 1,
         "focus_automatic_continuous": 0,
         "white_balance_temperature": 4200,
-        "exposure_time_absolute": 80,
+        "exposure_time_absolute": 50,
         "focus_absolute": 414,
         "saturation": 60,
         "gain": 0,
@@ -46,7 +46,7 @@
         "auto_exposure": 1,
         "focus_automatic_continuous": 0,
         "white_balance_temperature": 4200,
-        "exposure_time_absolute": 80,
+        "exposure_time_absolute": 50,
         "focus_absolute": 750,
         "saturation": 60,
         "gain": 0,
@@ -75,7 +75,7 @@
   },
   "serial": {
     "enabled": false,
-    "device": "/dev/serial/by-id/REPLACE_WITH_RESULT_UART",
+    "device": "/dev/ttyACM0",
     "baud": 115200
   },
   "coordinator": {
@@ -83,10 +83,10 @@
     "maix_tcp_host": "0.0.0.0",
     "maix_tcp_port": 5000,
     "maix_serial": "/dev/serial/by-id/REPLACE_WITH_MAIX_UART",
-    "mcu_serial": "/dev/serial/by-id/REPLACE_WITH_MCU_UART",
+    "mcu_serial": "/dev/ttyACM0",
     "baud": 115200,
     "scene": "TURNTABLE",
-    "timeout_s": 20.0,
+    "timeout_s": 50.0,
     "action_timeout_s": 30.0,
     "result_valid_ms": 250,
     "revoke_after_misses": 2,
@@ -143,7 +143,7 @@
     "parameter_notice": "TEMPORARY SCREEN TEST PARAMETER - NEED RECALIBRATION WITH REAL MATERIAL",
     "morphology": {
       "kernel_size": 3,
-      "open_iterations": 1,
+      "open_iterations": 0,
       "close_iterations": 1
     },
     "geometry": {
@@ -168,17 +168,17 @@
         {
           "h_min": 0,
           "h_max": 10,
-          "s_min": 100,
+          "s_min": 90,
           "s_max": 255,
-          "v_min": 60,
+          "v_min": 140,
           "v_max": 255
         },
         {
-          "h_min": 170,
+          "h_min": 140,
           "h_max": 179,
-          "s_min": 100,
+          "s_min": 90,
           "s_max": 255,
-          "v_min": 60,
+          "v_min": 140,
           "v_max": 255
         }
       ]
@@ -188,11 +188,11 @@
       "parameter_notice": "TEMPORARY SCREEN TEST PARAMETER - NEED RECALIBRATION WITH REAL MATERIAL",
       "hsv_ranges": [
         {
-          "h_min": 20,
-          "h_max": 40,
-          "s_min": 100,
+          "h_min": 30,
+          "h_max": 50,
+          "s_min": 60,
           "s_max": 255,
-          "v_min": 70,
+          "v_min": 160,
           "v_max": 255
         }
       ]
@@ -204,9 +204,9 @@
         {
           "h_min": 108,
           "h_max": 135,
-          "s_min": 80,
+          "s_min": 210,
           "s_max": 255,
-          "v_min": 50,
+          "v_min": 150,
           "v_max": 255
         }
       ]
@@ -216,11 +216,11 @@
       "parameter_notice": "TEMPORARY SCREEN TEST PARAMETER - NEED RECALIBRATION WITH REAL MATERIAL",
       "hsv_ranges": [
         {
-          "h_min": 45,
-          "h_max": 85,
-          "s_min": 80,
+          "h_min": 60,
+          "h_max": 100,
+          "s_min": 170,
           "s_max": 255,
-          "v_min": 40,
+          "v_min": 110,
           "v_max": 255
         }
       ]
@@ -336,16 +336,16 @@
     },
     "TURNTABLE": {
       "turntable_roi": [
-        340,
-        70,
-        600,
-        600
+        0,
+        0,
+        1280,
+        720
       ],
       "object_roi": {
-        "x": 340,
-        "y": 70,
-        "width": 600,
-        "height": 600
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
       },
       "min_area": 700,
       "max_area": 500000
@@ -415,16 +415,16 @@
     },
     "STORAGE": {
       "object_roi": {
-        "x": 80,
-        "y": 170,
-        "width": 1120,
-        "height": 430
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
       },
       "ring_search_roi": {
-        "x": 80,
-        "y": 170,
-        "width": 1120,
-        "height": 430
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
       },
       "ring_rois": {
         "1": [
