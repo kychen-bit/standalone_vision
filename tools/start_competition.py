@@ -156,6 +156,12 @@ def main():
     if args.dry_run:
         print('DRY_RUN: no devices opened, no network changes, coordinator not started.', flush=True)
         return 0
+    if (not args.check_only
+            and config['coordinator'].get('maix_transport', 'tcp') == 'tcp'
+            and not args.skip_network_config):
+        from tools.configure_maix_network import ensure_maix_network
+        if ensure_maix_network(required=False) is None:
+            print('[NETWORK] Maix is absent; the service will retry after other required devices appear.', flush=True)
     errors = preflight(args, config, devices)
     if errors:
         for error in errors:
@@ -164,10 +170,6 @@ def main():
     if args.check_only:
         print('PREFLIGHT_OK: paths/dependencies only; camera streaming, port availability and MCU protocol remain untested.', flush=True)
         return 0
-    if config['coordinator'].get('maix_transport', 'tcp') == 'tcp' and not args.skip_network_config:
-        from tools.configure_maix_network import ensure_maix_network
-        if ensure_maix_network(required=False) is None:
-            print('[NETWORK] Maix is absent; after connecting it run tools/configure_maix_network.py (or use the installed udev setup).', flush=True)
     print('[RUN] Wait for COORDINATOR_READY, then MCU START -> READY, then show QR to Maix. Ctrl+C stops the service.', flush=True)
     os.chdir(str(PROJECT_ROOT))
     os.execv(sys.executable, command)

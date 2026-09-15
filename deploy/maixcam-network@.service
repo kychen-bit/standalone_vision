@@ -1,0 +1,11 @@
+[Unit]
+Description=Configure MaixCAM USB network interface %I
+Wants=NetworkManager.service
+After=NetworkManager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/ysu/standalone_vision/tools/configure_maix_network.py
+Restart=on-failure
+RestartSec=1

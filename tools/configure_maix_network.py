@@ -70,6 +70,22 @@ def ensure_maix_network(
             )
         return None
 
+    # The coordinator service normally runs without root privileges. When the
+    # persistent profile is already correct, do not attempt a privileged write.
+    active_profile = _run(
+        ["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", interface]
+    )
+    active_addresses = _run(
+        ["nmcli", "-g", "IP4.ADDRESS", "device", "show", interface]
+    ).splitlines()
+    if active_profile == profile and address in active_addresses:
+        print(
+            "[NETWORK] %s already uses %s via %s"
+            % (interface, address, profile),
+            flush=True,
+        )
+        return interface
+
     profile_exists = subprocess.run(
         ["nmcli", "connection", "show", profile],
         stdout=subprocess.DEVNULL,
