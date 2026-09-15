@@ -2,6 +2,8 @@
 
 from collections import deque
 import json
+import os
+from pathlib import Path
 import platform
 import subprocess
 import threading
@@ -20,53 +22,42 @@ class UVCCamera:
         self.source = source
         self._apply_v4l2_controls(config, source)
         self.backend_name = str(config.get("backend", "opencv_v4l2")).lower()
-        self.gstreamer_pipeline = None
-        if self.backend_name == "gstreamer_nv":
-            self.gstreamer_pipeline = self._build_gstreamer_pipeline(config, source)
-            self.capture = cv2.VideoCapture(
-                self.gstreamer_pipeline, cv2.CAP_GSTREAMER
-            )
-        elif self.backend_name == "opencv_v4l2":
-            if platform.system() == "Linux":
-                backend = cv2.CAP_V4L2
-            elif platform.system() == "Windows":
-                backend = cv2.CAP_DSHOW
-            else:
-                backend = cv2.CAP_ANY
-            self.capture = cv2.VideoCapture(source, backend)
-        else:
+        if self.backend_name not in ("opencv_v4l2", "gstreamer_nv"):
             raise ValueError(
                 "camera.backend must be opencv_v4l2 or gstreamer_nv"
             )
-        if (
-            not self.capture.isOpened()
-            and self.backend_name == "gstreamer_nv"
-            and str(config.get("backend_fallback", "")).lower()
-            == "opencv_v4l2"
-        ):
+        self.lock_handle = None
+        self._lock_device(config, source)
+        # A camera that is mid re-enumeration answers an open with EBUSY/EIO.
+        # Retrying with a delay instead of exiting immediately avoids turning a
+        # 2 second USB hiccup into a service restart loop that re-opens and
+        # re-configures the device again and again.
+        attempts = max(1, int(config.get("open_retries", 3)))
+        retry_delay_s = max(0.0, float(config.get("open_retry_delay_s", 1.0)))
+        for attempt in range(attempts):
+            self.gstreamer_pipeline = None
+            self.capture = self._open_capture(config, source)
+            if self.capture.isOpened():
+                break
             self.capture.release()
+            if attempt + 1 >= attempts:
+                raise RuntimeError(self._open_failure_message(config, source))
             print(
                 json.dumps(
                     {
-                        "state": "CAMERA_BACKEND_WARNING",
+                        "state": "CAMERA_OPEN_RETRY",
+                        "device": str(source),
+                        "attempt": attempt + 1,
+                        "attempts": attempts,
                         "message": (
-                            "gstreamer_nv negotiation failed; falling back to "
-                            "opencv_v4l2 (capture may remain near 30 FPS)"
+                            "camera did not open; a UVC device that is "
+                            "re-enumerating answers open() with an error"
                         ),
                     }
                 ),
                 flush=True,
             )
-            self.backend_name = "opencv_v4l2"
-            self.gstreamer_pipeline = None
-            self.capture = cv2.VideoCapture(source, cv2.CAP_V4L2)
-        if not self.capture.isOpened():
-            if self.gstreamer_pipeline:
-                raise RuntimeError(
-                    "cannot open camera %r through gstreamer_nv; "
-                    "retry with --camera-backend opencv_v4l2" % (source,)
-                )
-            raise RuntimeError("cannot open camera %r" % (source,))
+            time.sleep(retry_delay_s)
         fourcc = config.get("fourcc", "MJPG")
         if self.backend_name == "opencv_v4l2":
             self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
@@ -126,6 +117,109 @@ class UVCCamera:
             )
             self._reader_thread.daemon = True
             self._reader_thread.start()
+
+    def _open_capture(self, config, source):
+        """Open the configured backend, honouring backend_fallback."""
+        if self.backend_name == "gstreamer_nv":
+            self.gstreamer_pipeline = self._build_gstreamer_pipeline(config, source)
+            capture = cv2.VideoCapture(self.gstreamer_pipeline, cv2.CAP_GSTREAMER)
+            if capture.isOpened():
+                return capture
+            if str(config.get("backend_fallback", "")).lower() != "opencv_v4l2":
+                return capture
+            capture.release()
+            print(
+                json.dumps(
+                    {
+                        "state": "CAMERA_BACKEND_WARNING",
+                        "message": (
+                            "gstreamer_nv negotiation failed; falling back to "
+                            "opencv_v4l2 (capture may remain near 30 FPS)"
+                        ),
+                    }
+                ),
+                flush=True,
+            )
+            self.backend_name = "opencv_v4l2"
+            self.gstreamer_pipeline = None
+        if platform.system() == "Linux":
+            backend = cv2.CAP_V4L2
+        elif platform.system() == "Windows":
+            backend = cv2.CAP_DSHOW
+        else:
+            backend = cv2.CAP_ANY
+        return cv2.VideoCapture(source, backend)
+
+    def _open_failure_message(self, config, source):
+        if self.backend_name == "gstreamer_nv":
+            return (
+                "cannot open camera %r through gstreamer_nv; "
+                "retry with --camera-backend opencv_v4l2" % (source,)
+            )
+        return "cannot open camera %r" % (source,)
+
+    @staticmethod
+    def _lock_path(config, source):
+        name = str(source).replace("/", "_").strip("_") or "0"
+        return Path(
+            config.get("lock_file")
+            or "/tmp/standalone-vision-camera-%s.lock" % name
+        )
+
+    def _lock_device(self, config, source):
+        """Warn (never fail) when a second process opened the same camera.
+
+        Two readers of one UVC device wedge the stream and push the camera into
+        the USB re-enumeration loop that produced the 196 GB udev log.
+        """
+        if not config.get("exclusive_lock", True) or platform.system() != "Linux":
+            return
+        try:
+            import fcntl
+        except ImportError:
+            return
+        path = self._lock_path(config, source)
+        try:
+            handle = open(path, "w")
+        except OSError:
+            return
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            print(
+                json.dumps(
+                    {
+                        "state": "CAMERA_BUSY_WARNING",
+                        "device": str(source),
+                        "message": (
+                            "another process already uses this camera; stop it "
+                            "(systemd service or a test script) before "
+                            "streaming, two readers wedge a UVC device"
+                        ),
+                    }
+                ),
+                flush=True,
+            )
+            return
+        handle.seek(0)
+        handle.truncate()
+        handle.write("%d\n" % os.getpid())
+        handle.flush()
+        self.lock_handle = handle
+
+    def _release_device_lock(self):
+        handle = getattr(self, "lock_handle", None)
+        if handle is None:
+            return
+        self.lock_handle = None
+        try:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            pass
+        handle.close()
 
     @staticmethod
     def _gstreamer_quote(value):
@@ -390,3 +484,4 @@ class UVCCamera:
         self.capture.release()
         if self._reader_thread is not None and self._reader_thread.is_alive():
             self._reader_thread.join(timeout=1.0)
+        self._release_device_lock()
