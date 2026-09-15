@@ -110,10 +110,10 @@ udev 触发 /lib/udev/uvcdynctrl → 又去查询同一组 XU 控制
 
 | 文件 | 作用 |
 |---|---|
-| `tools/disk_guard.py` | 采样磁盘占用与 `uvcdynctrl-udev.log` 的体积、**增长速率**和触发次数，超过阈值自动截断，输出 JSON；触发次数/小时可作为「相机是否在枚举风暴」的指示器 |
+| `tools/disk_guard.py` | 采样磁盘占用与 `uvcdynctrl-udev.log` 的体积、**增长速率**和触发次数，超过阈值自动截断，输出 JSON；同时自检"防护是否装好"（`guard` 字段），触发次数/小时可作为「相机是否在枚举风暴」的指示器 |
 | `deploy/disk-guard.service` + `.timer` | 每 5 分钟跑一次上面这个守护 |
-| `deploy/logrotate/uvcdynctrl-udev` | 万一 udev 脚本被还原，8 MB 轮转兜底 |
-| `tools/install_log_guard.sh` | 一键安装：把 `/lib/udev/uvcdynctrl` 的 `debug=1` 改成 `debug=0`（日志写 `/dev/null`）、装 logrotate、装定时守护、限制 journal（`SystemMaxUse=1G`、`SystemKeepFree=8G`） |
+| `deploy/logrotate/uvcdynctrl-udev` | 万一 udev 脚本被还原，8 MB 轮转兜底（需要 `logrotate` 包，可选） |
+| `tools/install_log_guard.sh` | 一键安装：把 `/lib/udev/uvcdynctrl` 的 `debug=1` 改成 `debug=0`（日志写 `/dev/null`）、装 logrotate（缺失时跳过或加 `--with-logrotate`）、装定时守护、限制 journal（`SystemMaxUse=1G`、`SystemKeepFree=8G`）；**任何可选步骤失败都不会中断安装**，最后打印自检表 |
 | `deploy/standalone-vision.service` | 重启改为有界：`StartLimitIntervalSec=600`、`StartLimitBurst=10`、`RestartSec=15`；`ExecStartPre` 改用 `--optional` |
 | `tools/configure_maix_network.py --optional` | MaixCAM 没插时打印提示并以 0 退出，不再让服务卡在 `ExecStartPre` 上反复重启 |
 | `jetson_recognition/camera.py` | 打开相机加**独占锁告警**（`CAMERA_BUSY_WARNING`，第二个进程打开同一台相机会被点出来）；打开失败改为按 `open_retries`/`open_retry_delay_s` 退避重试，不再立刻崩溃重启 |
@@ -126,21 +126,53 @@ udev 触发 /lib/udev/uvcdynctrl → 又去查询同一组 XU 控制
 ```bash
 cd /home/ysu/standalone_vision
 sudo bash tools/install_log_guard.sh
+# 需要轮转兜底时（本机默认没装 logrotate 包）：
+sudo bash tools/install_log_guard.sh --with-logrotate
 ```
 
 该脚本把 udev 脚本的 `debug` 关掉后，**即使相机再进入枚举风暴也不会产生日志**；
-logrotate、磁盘守护、journal 上限只是第二层保险。
+logrotate（可选）、磁盘守护、journal 上限只是第二层保险。
+
+脚本结尾会打印自检表，逐行确认这几项：
+
+```text
+udev helper   : debug=0     ← 关键项，必须为 0
+logrotate     : not installed (optional)  或  installed, config present
+guard timer   : enabled / active           ← 每 5 分钟截断兜底
+journal cap   : present
+```
+
+> 踩坑记录：脚本第一版用 `set -e` + `logrotate --debug` 做校验，而这台 Jetson
+> **没有装 logrotate 包**（`command not found`，退出码 127），导致安装在第 2 步
+> 中断，第 3、4 步（守护定时器、journal 上限）从未执行。现在改为记录失败并继续，
+> 结尾统一列出失败项，因此不会再出现"看起来装好了其实只装了一半"。
 
 ### 3.2 比赛前确认状态
 
 ```bash
-# 磁盘与日志
-df -h /
+# 一条命令看"还会不会爆"（不需要 sudo）
 python3 tools/disk_guard.py --no-truncate
+```
 
-# 守护是否在跑
+关键字段：
+
+```json
+"guard": {"uvcdynctrl_debug": "0", "uvcdynctrl_log_disabled": true, ...}
+```
+
+* `uvcdynctrl_log_disabled` 必须为 `true`（即 `debug=0`）：满足这一条，**日志就绝不会再被写大**；
+* `disk_guard_timer_active` 建议为 `active`，缺失会给出 warning（只是兜底缺一层，不影响根因已修复的结论）；
+* `uvcdynctrl_log.firings_per_hour` 应接近 0，持续上涨说明相机还在重枚举，需处理 USB 侧。
+
+```bash
+# 其它检查
+df -h /
 systemctl list-timers disk-guard.timer --no-pager
 journalctl -u disk-guard.service -n 20 --no-pager
+
+# 端到端验证（任选其一，之后日志大小应不变）
+#   1) 拔插一次相机
+#   2) sudo udevadm trigger --subsystem-match=video4linux
 
 # 相机是否在反复重枚举（另开一个终端，运行整机程序时观察）
 udevadm monitor --subsystem-match=video4linux
