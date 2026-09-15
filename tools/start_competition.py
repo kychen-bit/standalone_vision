@@ -14,6 +14,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# The 2026 incident: /lib/udev/uvcdynctrl appended ~2.3 KB per video4linux add
+# event to this file until it reached 196 GB and filled the system disk.
+UVCDYNCTRL_LOG = Path('/var/log/uvcdynctrl-udev.log')
+
 
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
@@ -28,6 +32,12 @@ def parser():
                       help='show resolved settings and command without hardware access')
     mode.add_argument('--check-only', action='store_true',
                       help='check dependencies/devices without opening them or changing network')
+    root.add_argument('--disk-warn-percent', type=float, default=85.0,
+                      help='warn above this filesystem usage (default 85)')
+    root.add_argument('--disk-fail-percent', type=float, default=95.0,
+                      help='refuse to launch above this filesystem usage (default 95)')
+    root.add_argument('--uvcdynctrl-log-max-mb', type=float, default=64.0,
+                      help='refuse to launch when the UVC udev log exceeds this size')
     return root
 
 
@@ -58,6 +68,42 @@ def launch_settings(args):
     if not args.headless:
         command.append('--gui')
     return config, command, devices
+
+
+def disk_findings(arguments, log_path=None):
+    """Refuse to start on a disk that is about to fill up again.
+
+    A full system disk breaks the GUI, the NVIDIA DRM and file copies long
+    before it breaks recognition, so this is checked before hardware is opened.
+    """
+    warnings = []
+    errors = []
+    log_path = Path(log_path) if log_path else UVCDYNCTRL_LOG
+    try:
+        usage = shutil.disk_usage(str(PROJECT_ROOT))
+        percent = usage.used / usage.total * 100.0 if usage.total else 0.0
+    except OSError as error:
+        warnings.append('cannot read filesystem usage: %s' % error)
+        percent = 0.0
+    if percent >= arguments.disk_fail_percent:
+        errors.append(
+            'filesystem is %.1f%% full; free space before launching '
+            '(see docs/Jetson磁盘写满与USB枚举风暴.md)' % percent
+        )
+    elif percent >= arguments.disk_warn_percent:
+        warnings.append('filesystem is %.1f%% full' % percent)
+    try:
+        log_size = log_path.stat().st_size
+    except OSError:
+        log_size = 0
+    if log_size > arguments.uvcdynctrl_log_max_mb * 1024 * 1024:
+        errors.append(
+            '%s is %.1f MB; the UVC udev helper is logging a camera '
+            're-enumeration storm. Truncate it and run '
+            "tools/install_log_guard.sh" % (
+                log_path, log_size / 1024.0 / 1024.0)
+        )
+    return warnings, errors
 
 
 def preflight(args, config, devices):
@@ -91,6 +137,10 @@ def preflight(args, config, devices):
     profiles = config['camera'].get('v4l2_control_profiles', {})
     if profile and profile not in profiles:
         errors.append('unknown camera profile: %s' % profile)
+    disk_warnings, disk_errors = disk_findings(args)
+    for warning in disk_warnings:
+        print('[PREFLIGHT] %s' % warning, file=sys.stderr)
+    errors.extend(disk_errors)
     return errors
 
 
