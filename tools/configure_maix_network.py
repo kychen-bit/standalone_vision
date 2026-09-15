@@ -127,8 +127,26 @@ def main():
     )
     parser.add_argument("--profile", default=DEFAULT_PROFILE)
     parser.add_argument("--address", default=DEFAULT_ADDRESS)
+    parser.add_argument(
+        "--optional",
+        action="store_true",
+        help=(
+            "exit 0 when the MaixCAM is unplugged; use this from systemd "
+            "ExecStartPre so a missing MaixCAM cannot loop the vision service"
+        ),
+    )
     arguments = parser.parse_args()
-    ensure_maix_network(arguments.profile, arguments.address, required=True)
+    interface = ensure_maix_network(
+        arguments.profile,
+        arguments.address,
+        required=not arguments.optional,
+    )
+    if interface is None:
+        print(
+            "[NETWORK] MaixCAM USB interface absent; skipping network setup "
+            "(the vision service keeps the TCP port open and waits)",
+            flush=True,
+        )
     return 0
 
 
