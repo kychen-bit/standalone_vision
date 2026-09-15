@@ -98,6 +98,7 @@ class DetectorTests(unittest.TestCase):
 
     def test_dynamic_roi_starts_after_stable_and_falls_back_same_frame(self):
         config = load_config()
+        config["color_detection"]["dynamic_roi"]["enabled"] = True
         engine = build_engine(config)
         session = engine.new_session("COLOR", ("red", "PAPER_TEST"))
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -127,6 +128,20 @@ class DetectorTests(unittest.TestCase):
         self.assertIsNotNone(measurement)
         self.assertEqual(engine.detector.last_color_runtime["mode"], "FIXED_ROI")
         self.assertAlmostEqual(measurement.pixel_x, 900.0, delta=2.0)
+
+    def test_competition_config_keeps_full_frame_after_stable(self):
+        config = load_config()
+        self.assertFalse(config["color_detection"]["dynamic_roi"]["enabled"])
+        engine = build_engine(config)
+        session = engine.new_session("COLOR", ("red", "TURNTABLE"))
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cv2.rectangle(frame, (300, 300), (400, 400), self.SCREEN_COLORS["1"], -1)
+        for index in range(20):
+            session.update(frame, timestamp=index * 0.02)
+        self.assertEqual(engine.detector.last_color_runtime["mode"], "FIXED_ROI")
+        self.assertEqual(
+            engine.detector.last_color_runtime["roi"], [0, 0, 1280, 720]
+        )
 
     def test_area_filter_rejects_small_noise(self):
         detector = TopViewDetector(load_config(), ROOT)

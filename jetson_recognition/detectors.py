@@ -573,6 +573,27 @@ class TopViewDetector:
             float(x_px), float(y_px),
         )
 
+    def detect_any_color(self, frame, scene, allowed_ids=None):
+        """Classify the strongest material among the allowed color IDs.
+
+        This is intended for turntable inspection, where reporting a
+        non-target color is meaningful.  Target-driven PICK continues to use
+        ``detect_color`` and is unaffected.
+        """
+        color_ids = (
+            [self._resolve_color_id(value) for value in allowed_ids]
+            if allowed_ids is not None
+            else sorted(self.color_ranges)
+        )
+        results = []
+        for color_id in color_ids:
+            measurement = self.detect_color(frame, color_id, scene)
+            if measurement is not None:
+                results.append(measurement)
+        if not results:
+            return None
+        return max(results, key=lambda item: item.confidence)
+
     def _detect_circle_in_roi(self, frame, roi_rect, parameters):
         roi, offset_x, offset_y = _crop(frame, roi_rect)
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)

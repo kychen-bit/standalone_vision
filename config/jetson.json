@@ -154,7 +154,7 @@
       "border_margin_px": 10
     },
     "dynamic_roi": {
-      "enabled": true,
+      "enabled": false,
       "margin_px": 80,
       "activate_after": "STABLE",
       "fallback": "FIXED_ROI_SAME_FRAME"
