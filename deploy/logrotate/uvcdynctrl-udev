@@ -1,0 +1,17 @@
+# Safety net for /var/log/uvcdynctrl-udev.log.
+#
+# The udev helper /lib/udev/uvcdynctrl appends its whole udev environment dump
+# (~2.3 KB) for every video4linux "add" event and never limits the file. The
+# real fix is tools/install_log_guard.sh, which sets debug=0 in that helper so
+# nothing is written at all; this rotation only protects against the case where
+# the package is reinstalled or the helper is restored from a backup.
+/var/log/uvcdynctrl-udev.log {
+    size 8M
+    rotate 3
+    copytruncate
+    missingok
+    notifempty
+    compress
+    delaycompress
+    su root root
+}

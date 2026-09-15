@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the vision disk guard every five minutes
+Documentation=file:///home/ysu/standalone_vision/docs/README.md
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=disk-guard.service
+
+[Install]
+WantedBy=multi-user.target

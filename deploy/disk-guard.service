@@ -1,0 +1,10 @@
+[Unit]
+Description=Guard against the UVC udev log filling the Jetson system disk
+Documentation=file:///home/ysu/standalone_vision/docs/README.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/ysu/standalone_vision/tools/disk_guard.py --truncate-mb 64
+# The guard itself must never take the machine down if it cannot read a file.
+SuccessExitStatus=0 1 2
