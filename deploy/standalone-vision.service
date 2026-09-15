@@ -1,0 +1,31 @@
+[Unit]
+Description=Standalone competition vision coordinator
+Wants=network-online.target
+After=network-online.target NetworkManager.service
+# Bounded restarts: an unbounded loop (StartLimitIntervalSec=0) re-opens the
+# UVC camera and rewrites its controls every RestartSec forever when a device
+# is missing. Repeated open/close of a flaky camera is what turns a USB
+# problem into the udev enumeration storm described in
+# docs/Jetson磁盘写满与USB枚举风暴.md.
+# Recovery after the limit is hit: sudo systemctl reset-failed standalone-vision
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=ysu
+Group=ysu
+WorkingDirectory=/home/ysu/standalone_vision
+Environment=PYTHONUNBUFFERED=1
+# --optional: a missing MaixCAM must not fail the unit. Otherwise ExecStartPre
+# fails, the service never reaches the coordinator, and systemd retries
+# forever while the MaixCAM is unplugged.
+ExecStartPre=+/usr/bin/python3 /home/ysu/standalone_vision/tools/configure_maix_network.py --optional
+ExecStart=/home/ysu/standalone_vision/run_competition.sh --headless --skip-network-config
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=10
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
