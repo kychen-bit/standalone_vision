@@ -1002,6 +1002,12 @@ def parser():
         "--mcu-serial", help="bidirectional UART to the electronics"
     )
     coordinator.add_argument(
+        "--mcu-repeat-last-frame-seconds",
+        type=float,
+        default=0.0,
+        help="debug only: resend the latest Jetson-to-MCU frame at this interval",
+    )
+    coordinator.add_argument(
         "--camera", help="camera index or /dev/v4l/by-id path"
     )
     coordinator.add_argument(

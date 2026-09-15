@@ -25,6 +25,8 @@ def parser():
     root.add_argument('--mcu-serial', help='real MCU /dev/serial/by-id/...; overrides config')
     root.add_argument('--camera', help='camera device path; overrides config')
     root.add_argument('--headless', action='store_true', help='disable Detection/Mask windows')
+    root.add_argument('--mcu-repeat-last-frame-seconds', type=float, default=0.0,
+                      help='debug only: resend the latest Jetson-to-MCU frame at this interval')
     root.add_argument('--skip-network-config', action='store_true',
                       help='use an already configured Maix network')
     mode = root.add_mutually_exclusive_group()
@@ -67,6 +69,9 @@ def launch_settings(args):
         command.extend(['--maix-serial', devices['maix_serial']])
     if not args.headless:
         command.append('--gui')
+    if args.mcu_repeat_last_frame_seconds > 0:
+        command.extend(['--mcu-repeat-last-frame-seconds',
+                        str(args.mcu_repeat_last_frame_seconds)])
     return config, command, devices
 
 

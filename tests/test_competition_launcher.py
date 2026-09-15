@@ -39,6 +39,16 @@ class CompetitionLauncherTests(unittest.TestCase):
                 preflight.assert_not_called()
                 execute.assert_not_called()
 
+    def test_repeat_last_mcu_frame_option_is_forwarded(self):
+        with tempfile.TemporaryDirectory() as work:
+            path = self.config_file(work)
+            args = launcher.parser().parse_args([
+                '--config', str(path), '--mcu-serial', '/dev/ttyUSB2',
+                '--mcu-repeat-last-frame-seconds', '1', '--headless'])
+            _, command, _ = launcher.launch_settings(args)
+            option = command.index('--mcu-repeat-last-frame-seconds')
+            self.assertEqual(command[option + 1], '1.0')
+
     def test_unconfigured_mcu_blocks_launch(self):
         with tempfile.TemporaryDirectory() as work:
             path = self.config_file(work)

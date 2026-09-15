@@ -602,6 +602,11 @@ def run_coordinator(arguments, config, engine, project_root, draw_result_fn=None
     camera = UVCCamera(config["camera"], project_root, arguments.camera)
     coordinator = VisionCoordinator(engine, coord)
     mcu_reader = FrameReader(mcu)
+    repeat_interval_s = max(
+        0.0, float(getattr(arguments, "mcu_repeat_last_frame_seconds", 0.0))
+    )
+    last_mcu_frame = None
+    next_mcu_repeat_s = None
     gui_enabled = bool(getattr(arguments, "gui", False))
     if gui_enabled and draw_result_fn is None:
         raise SystemExit("coordinator GUI drawing function is unavailable")
@@ -627,23 +632,34 @@ def run_coordinator(arguments, config, engine, project_root, draw_result_fn=None
             # Apply MCU control state first. If START and a queued TCP QR arrive
             # in the same loop, START must establish WAIT_TASK before MAIX_QR.
             for name, fields in mcu_reader.read_frames():
+                print(
+                    json.dumps(
+                        {"state": "MCU_RX", "frame": name, "fields": fields},
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
                 coordinator.on_mcu_frame(name, fields)
             for name, fields in maix_reader.read_frames():
                 if name == "MAIX_QR" and fields:
                     task_status = coordinator.accept_task_code(fields[0])
-                    if task_status in ("DUPLICATE", "LOCKED"):
-                        print(
-                            json.dumps(
-                                {
-                                    "state": "MAIX_TASK_CODE_IGNORED",
-                                    "reason": task_status,
-                                    "received": fields[0],
-                                    "active": coordinator.task_raw,
-                                },
-                                ensure_ascii=False,
-                            ),
-                            flush=True,
-                        )
+                    print(
+                        json.dumps(
+                            {
+                                "state": (
+                                    "MAIX_TASK_CODE_ACCEPTED"
+                                    if task_status == "ACCEPTED"
+                                    else "MAIX_TASK_CODE_IGNORED"
+                                ),
+                                "reason": task_status,
+                                "received": fields[0],
+                                "active": coordinator.task_raw,
+                                "coordinator_state": coordinator.state,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
             frame = camera.read()
             if frame is not None:
                 coordinator.update(frame, now_s)
@@ -714,13 +730,75 @@ def run_coordinator(arguments, config, engine, project_root, draw_result_fn=None
                         break
             for name, fields in coordinator.drain():
                 try:
-                    mcu.write(encode_frame(name, *fields))
+                    wire_frame = encode_frame(name, *fields)
+                    written = mcu.write(wire_frame)
+                    if written != len(wire_frame):
+                        raise OSError(
+                            "short serial write: %d/%d bytes"
+                            % (written, len(wire_frame))
+                        )
+                    mcu.flush()
+                    last_mcu_frame = (wire_frame, name, list(fields))
+                    next_mcu_repeat_s = now_s + repeat_interval_s
+                    print(
+                        json.dumps(
+                            {
+                                "state": "MCU_TX",
+                                "frame": name,
+                                "fields": fields,
+                                "bytes": written,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
                 except (OSError, UnicodeError, ValueError) as error:
                     print(
                         json.dumps(
                             {
                                 "state": "COORDINATOR_TX_ERROR",
                                 "frame": name,
+                                "error": str(error),
+                            }
+                        ),
+                        flush=True,
+                    )
+            if (
+                repeat_interval_s > 0.0
+                and last_mcu_frame is not None
+                and next_mcu_repeat_s is not None
+                and now_s >= next_mcu_repeat_s
+            ):
+                wire_frame, name, fields = last_mcu_frame
+                try:
+                    written = mcu.write(wire_frame)
+                    if written != len(wire_frame):
+                        raise OSError(
+                            "short serial write: %d/%d bytes"
+                            % (written, len(wire_frame))
+                        )
+                    mcu.flush()
+                    next_mcu_repeat_s = now_s + repeat_interval_s
+                    print(
+                        json.dumps(
+                            {
+                                "state": "MCU_TX_REPEAT",
+                                "frame": name,
+                                "fields": fields,
+                                "bytes": written,
+                                "interval_s": repeat_interval_s,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                except OSError as error:
+                    print(
+                        json.dumps(
+                            {
+                                "state": "COORDINATOR_TX_ERROR",
+                                "frame": name,
+                                "repeat": True,
                                 "error": str(error),
                             }
                         ),
