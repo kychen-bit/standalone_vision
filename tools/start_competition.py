@@ -100,7 +100,7 @@ def disk_findings(arguments, log_path=None):
         errors.append(
             '%s is %.1f MB; the UVC udev helper is logging a camera '
             're-enumeration storm. Truncate it and run '
-            "tools/install_log_guard.sh" % (
+            'tools/install_log_guard.sh' % (
                 log_path, log_size / 1024.0 / 1024.0)
         )
     return warnings, errors
