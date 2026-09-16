@@ -20,14 +20,18 @@ class UVCCamera:
         if isinstance(source, str) and source.isdigit():
             source = int(source)
         self.source = source
-        self._apply_v4l2_controls(config, source)
+        self.lock_handle = None
+        self._lock_device(config, source)
+        try:
+            self._apply_v4l2_controls(config, source)
+        except Exception:
+            self._release_device_lock()
+            raise
         self.backend_name = str(config.get("backend", "opencv_v4l2")).lower()
         if self.backend_name not in ("opencv_v4l2", "gstreamer_nv"):
             raise ValueError(
                 "camera.backend must be opencv_v4l2 or gstreamer_nv"
             )
-        self.lock_handle = None
-        self._lock_device(config, source)
         # A camera that is mid re-enumeration answers an open with EBUSY/EIO.
         # Retrying with a delay instead of exiting immediately avoids turning a
         # 2 second USB hiccup into a service restart loop that re-opens and
@@ -160,14 +164,20 @@ class UVCCamera:
 
     @staticmethod
     def _lock_path(config, source):
-        name = str(source).replace("/", "_").strip("_") or "0"
+        # /dev/v4l/by-id/... and /dev/videoN can name the same camera. Use
+        # the resolved device path so independently launched tools contend on
+        # one lock instead of opening one UVC stream twice and wedging it.
+        canonical_source = source
+        if isinstance(source, str) and source.startswith("/dev/"):
+            canonical_source = os.path.realpath(source)
+        name = str(canonical_source).replace("/", "_").strip("_") or "0"
         return Path(
             config.get("lock_file")
             or "/tmp/standalone-vision-camera-%s.lock" % name
         )
 
     def _lock_device(self, config, source):
-        """Warn (never fail) when a second process opened the same camera.
+        """Refuse a second process opening the same physical camera.
 
         Two readers of one UVC device wedge the stream and push the camera into
         the USB re-enumeration loop that produced the 196 GB udev log.
@@ -187,21 +197,11 @@ class UVCCamera:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             handle.close()
-            print(
-                json.dumps(
-                    {
-                        "state": "CAMERA_BUSY_WARNING",
-                        "device": str(source),
-                        "message": (
-                            "another process already uses this camera; stop it "
-                            "(systemd service or a test script) before "
-                            "streaming, two readers wedge a UVC device"
-                        ),
-                    }
-                ),
-                flush=True,
+            raise RuntimeError(
+                "camera %s is already used by another standalone-vision "
+                "process; stop standalone-vision.service or the other test "
+                "before opening it again" % source
             )
-            return
         handle.seek(0)
         handle.truncate()
         handle.write("%d\n" % os.getpid())

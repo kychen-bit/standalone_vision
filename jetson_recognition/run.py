@@ -565,8 +565,15 @@ def run_live(arguments, config, engine, output):
                 )
             last_state = state
             if not arguments.headless:
+                # Colour modes run on the white-balanced frame; show that frame
+                # so the HSV probe reports the values the thresholds use.
+                display_frame = frame
+                if arguments.mode.upper() in ("COLOR", "STACK"):
+                    balanced = engine.detector.last_balanced_frame
+                    if balanced is not None:
+                        display_frame = balanced
                 canvas = draw_result(
-                    frame,
+                    display_frame,
                     measurement,
                     state,
                     count,
@@ -575,8 +582,24 @@ def run_live(arguments, config, engine, output):
                     performance if visual["show_fps"] else None,
                     visual["draw_search_roi"],
                 )
+                if display_frame is not frame:
+                    light = engine.detector.last_illumination or {}
+                    cv2.putText(
+                        canvas,
+                        "WHITE BALANCED ref=%s gain=%s %s" % (
+                            light.get("white_ref_bgr"),
+                            light.get("gain"),
+                            light.get("reason"),
+                        ),
+                        (10, canvas.shape[0] - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
                 if hsv_probe is not None:
-                    canvas = hsv_probe.draw(frame, canvas)
+                    canvas = hsv_probe.draw(display_frame, canvas)
                 cv2.imshow(window_name, canvas)
                 debug = engine.detector.last_color_debug
                 if visual["show_mask"] and debug and debug.get("mask") is not None:

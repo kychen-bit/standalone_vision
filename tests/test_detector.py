@@ -80,6 +80,33 @@ class DetectorTests(unittest.TestCase):
         self.assertAlmostEqual(blue.pixel_x, 350.0, delta=2.0)
         self.assertAlmostEqual(light_blue.pixel_x, 750.0, delta=2.0)
 
+    def test_multi_color_detection_converts_full_roi_to_hsv_once(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cv2.circle(frame, (350, 350), 50, self.SCREEN_COLORS["1"], -1)
+        cv2.circle(frame, (700, 350), 50, self.SCREEN_COLORS["4"], -1)
+        original = cv2.cvtColor
+        calls = []
+
+        def counting_cvt_color(image, code):
+            if code == cv2.COLOR_BGR2HSV:
+                calls.append(image.shape)
+            return original(image, code)
+
+        cv2.cvtColor = counting_cvt_color
+        try:
+            results = detector.detect_colors(frame, "TURNTABLE", ["1", "4", "5"])
+        finally:
+            cv2.cvtColor = original
+
+        # The search ROI is converted once for all colours. The illuminant
+        # estimator converts its own downscaled copy separately, which is not
+        # what this regression is about.
+        roi_conversions = [shape for shape in calls if shape == (720, 1280, 3)]
+        self.assertEqual(roi_conversions, [(720, 1280, 3)])
+        self.assertEqual({result.target_id for result in results}, {"1", "4"})
+        self.assertEqual(detector.last_color_runtime["mode"], "SHARED_FIXED_ROI")
+
     def test_fixed_roi_ignores_outside_and_returns_global_center(self):
         config = load_config()
         config["scenes"]["PAPER_TEST"]["object_roi"] = {
@@ -219,6 +246,17 @@ class DetectorTests(unittest.TestCase):
             with self.subTest(hue=hue):
                 self.assertIsNotNone(detector.detect_color(frame, "black", "PAPER_TEST"))
 
+    def test_black_rejects_irregular_shadow(self):
+        detector = TopViewDetector(load_config(), ROOT)
+        frame = np.full((720, 1280, 3), 180, dtype=np.uint8)
+        shadow = np.asarray(
+            [(350, 250), (720, 290), (760, 330), (600, 355),
+             (730, 410), (380, 440), (300, 350)],
+            dtype=np.int32,
+        )
+        cv2.fillPoly(frame, [shadow], (35, 35, 35))
+        self.assertIsNone(detector.detect_color(frame, "black", "PAPER_TEST"))
+
     def test_debug_contains_one_mask_roi_box_and_contour(self):
         detector = TopViewDetector(load_config(), ROOT)
         detector.set_color_debug(True)
@@ -251,10 +289,16 @@ class DetectorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             TopViewDetector(config, ROOT)
 
-    def test_default_config_contains_no_lab_classifier(self):
+    def test_default_config_uses_white_balanced_hsv_ranges(self):
         config = load_config()
         self.assertNotIn("color_classifier", config)
-        self.assertEqual(config["color_detection"]["algorithm"], "HSV_CONTOUR_V1")
+        self.assertEqual(
+            config["color_detection"]["algorithm"],
+            "HSV_CONTOUR_V1_WHITE_BALANCED",
+        )
+        # The 2026 rule change removed the downward fill light, so the shipped
+        # configuration must normalise the illuminant per frame.
+        self.assertTrue(config["color_detection"]["illumination"]["enabled"])
 
     def test_ring_detection_selects_requested_digit_and_global_coordinates(self):
         detector = TopViewDetector(load_config(), ROOT)

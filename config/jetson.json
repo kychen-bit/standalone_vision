@@ -45,8 +45,8 @@
         "white_balance_automatic": 0,
         "auto_exposure": 1,
         "focus_automatic_continuous": 0,
-        "white_balance_temperature": 4200,
-        "exposure_time_absolute": 50,
+        "white_balance_temperature": 4000,
+        "exposure_time_absolute": 80,
         "focus_absolute": 750,
         "saturation": 60,
         "gain": 0,
@@ -139,8 +139,41 @@
     "search_timeout_s": 20.0
   },
   "color_detection": {
-    "algorithm": "HSV_CONTOUR_V1",
+    "algorithm": "HSV_CONTOUR_V1_WHITE_BALANCED",
     "parameter_notice": "TEMPORARY SCREEN TEST PARAMETER - NEED RECALIBRATION WITH REAL MATERIAL",
+    "illumination": {
+      "enabled": true,
+      "notice": "Per-frame white balance from the matte white field. The rule change removed the downward fill light, so without this the HSV ranges only hold for the light they were tuned under. Set enabled=false to compare against the old behaviour; the live tool prints the estimated white level and gain.",
+      "reference_percentile": 88.0,
+      "neutral_max_chroma": 0.35,
+      "neutral_max_chroma_relaxed": 0.55,
+      "min_level": 20.0,
+      "max_level": 255.0,
+      "clip_level": 250.0,
+      "max_clipped_ratio": 0.5,
+      "min_neutral_ratio": 0.02,
+      "smoothing": 0.25,
+      "hold_smoothing": 0.02,
+      "canonical_level": 235.0,
+      "max_gain": 4.0,
+      "gain_epsilon": 0.04,
+      "hold_jump_ratio": 1.6,
+      "estimate_width": 256
+    },
+    "label_classifier": {
+      "notice": "Distances are measured in normalised HSV units. The configured hsv_ranges act as prototypes, so the ranges stay the only place where colour behaviour is tuned.",
+      "hue_scale": 20.0,
+      "saturation_scale": 60.0,
+      "value_scale": 50.0,
+      "center_weight": 0.05,
+      "accept_distance": 1.0
+    },
+    "material_grouping": {
+      "notice": "Round-batch material classification. merge_distance_px joins the blue/light-blue masks that describe the same physical part.",
+      "merge_distance_px": 40.0,
+      "max_label_distance": 1.0,
+      "min_label_margin": 0.0
+    },
     "morphology": {
       "kernel_size": 3,
       "open_iterations": 0,
@@ -151,6 +184,7 @@
       "max_area": 500000,
       "min_aspect_ratio": 0.65,
       "max_aspect_ratio": 1.55,
+      "black_min_circularity": 0.7,
       "border_margin_px": 10
     },
     "dynamic_roi": {

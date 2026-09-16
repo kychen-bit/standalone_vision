@@ -21,6 +21,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 UVCDYNCTRL_HELPER="/lib/udev/uvcdynctrl"
+UVCDYNCTRL_RULE_MASK="/etc/udev/rules.d/80-uvcdynctrl.rules"
 LOGROTATE_TARGET="/etc/logrotate.d/uvcdynctrl-udev"
 JOURNAL_DROPIN_DIR="/etc/systemd/journald.conf.d"
 JOURNAL_DROPIN="${JOURNAL_DROPIN_DIR}/99-standalone-vision-limits.conf"
@@ -53,7 +54,7 @@ if [[ "${EUID}" -ne 0 ]]; then
     exit 1
 fi
 
-echo "[1/5] Point the uvcdynctrl helper at /dev/null (debug=0)"
+echo "[1/5] Disable the legacy uvcdynctrl udev helper"
 if [[ -f "${UVCDYNCTRL_HELPER}" ]]; then
     if grep -q '^debug=1' "${UVCDYNCTRL_HELPER}"; then
         [[ -f "${UVCDYNCTRL_HELPER}.orig" ]] || \
@@ -67,6 +68,13 @@ if [[ -f "${UVCDYNCTRL_HELPER}" ]]; then
     fi
 else
     note "uvcdynctrl helper absent; nothing to patch"
+fi
+ln -sfn /dev/null "${UVCDYNCTRL_RULE_MASK}" \
+    || fail "mask ${UVCDYNCTRL_RULE_MASK}"
+if [[ "$(readlink "${UVCDYNCTRL_RULE_MASK}" 2>/dev/null)" == "/dev/null" ]]; then
+    note "udev rule masked: ${UVCDYNCTRL_RULE_MASK} -> /dev/null"
+else
+    fail "uvcdynctrl udev rule is still active"
 fi
 udevadm control --reload-rules || fail "udevadm control --reload-rules"
 
@@ -116,6 +124,7 @@ systemctl enable --now disk-guard.timer || fail "enable disk-guard.timer"
 echo "[5/5] Self-check"
 helper_debug="$(grep -m1 '^debug=' "${UVCDYNCTRL_HELPER}" 2>/dev/null || echo 'debug=<unknown>')"
 note "udev helper   : ${helper_debug}   (debug=0 means the log is /dev/null)"
+note "udev rule     : $(readlink "${UVCDYNCTRL_RULE_MASK}" 2>/dev/null || echo active)   (/dev/null means disabled)"
 note "logrotate     : $(command -v logrotate >/dev/null 2>&1 && echo "installed, $( [[ -f ${LOGROTATE_TARGET} ]] && echo 'config present' || echo 'no config')" || echo 'not installed (optional)')"
 note "guard timer   : $(systemctl is-enabled disk-guard.timer 2>&1) / $(systemctl is-active disk-guard.timer 2>&1)"
 note "journal cap   : $( [[ -f ${JOURNAL_DROPIN} ]] && echo present || echo missing)"
@@ -134,8 +143,9 @@ fi
 
 cat <<'EOF'
 
-Done. The UVC udev helper no longer writes a log; the five minute disk-guard
-timer is the active safety net (logrotate is optional extra).
+Done. The legacy uvcdynctrl udev helper is disabled and no longer queries each
+new video node or writes a log; the five minute disk-guard timer is the safety
+net (logrotate is optional extra).
 
 Verify it any time without sudo:
     python3 tools/disk_guard.py --no-truncate     # guard state, sizes, growth rate

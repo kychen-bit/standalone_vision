@@ -113,7 +113,7 @@ udev 触发 /lib/udev/uvcdynctrl → 又去查询同一组 XU 控制
 | `tools/disk_guard.py` | 采样磁盘占用与 `uvcdynctrl-udev.log` 的体积、**增长速率**和触发次数，超过阈值自动截断，输出 JSON；同时自检"防护是否装好"（`guard` 字段），触发次数/小时可作为「相机是否在枚举风暴」的指示器 |
 | `deploy/disk-guard.service` + `.timer` | 每 5 分钟跑一次上面这个守护 |
 | `deploy/logrotate/uvcdynctrl-udev` | 万一 udev 脚本被还原，8 MB 轮转兜底（需要 `logrotate` 包，可选） |
-| `tools/install_log_guard.sh` | 一键安装：把 `/lib/udev/uvcdynctrl` 的 `debug=1` 改成 `debug=0`（日志写 `/dev/null`）、装 logrotate（缺失时跳过或加 `--with-logrotate`）、装定时守护、限制 journal（`SystemMaxUse=1G`、`SystemKeepFree=8G`）；**任何可选步骤失败都不会中断安装**，最后打印自检表 |
+| `tools/install_log_guard.sh` | 一键安装：用 `/etc/udev/rules.d/80-uvcdynctrl.rules -> /dev/null` 屏蔽旧版动态控制规则，同时把 helper 的 `debug=1` 改成 `debug=0`；再装 logrotate、定时守护并限制 journal。项目只使用标准 V4L2 控制，不需要这个旧 helper。 |
 | `deploy/standalone-vision.service` | 重启改为有界：`StartLimitIntervalSec=600`、`StartLimitBurst=10`、`RestartSec=15`；`ExecStartPre` 改用 `--optional` |
 | `tools/configure_maix_network.py --optional` | MaixCAM 没插时打印提示并以 0 退出，不再让服务卡在 `ExecStartPre` 上反复重启 |
 | `jetson_recognition/camera.py` | 打开相机加**独占锁告警**（`CAMERA_BUSY_WARNING`，第二个进程打开同一台相机会被点出来）；打开失败改为按 `open_retries`/`open_retry_delay_s` 退避重试，不再立刻崩溃重启 |
@@ -130,13 +130,15 @@ sudo bash tools/install_log_guard.sh
 sudo bash tools/install_log_guard.sh --with-logrotate
 ```
 
-该脚本把 udev 脚本的 `debug` 关掉后，**即使相机再进入枚举风暴也不会产生日志**；
+该脚本会屏蔽旧 `uvcdynctrl` udev 规则，并把脚本的 `debug` 关掉。相机节点创建时
+不再运行 `uvcdynctrl --addctrl` 查询扩展控制，枚举风暴也不会继续放大日志；
 logrotate（可选）、磁盘守护、journal 上限只是第二层保险。
 
 脚本结尾会打印自检表，逐行确认这几项：
 
 ```text
 udev helper   : debug=0     ← 关键项，必须为 0
+udev rule     : /dev/null   ← 关键项，旧动态控制 helper 已禁用
 logrotate     : not installed (optional)  或  installed, config present
 guard timer   : enabled / active           ← 每 5 分钟截断兜底
 journal cap   : present

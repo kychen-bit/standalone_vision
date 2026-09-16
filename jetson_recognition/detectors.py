@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from .geometry import apply_homography, estimate_rigid_pose
+from .illumination import WhiteBalanceNormalizer
 from .model import Measurement
 
 
@@ -124,6 +125,11 @@ class TopViewDetector:
         self.color_border_margin = max(
             0, int(geometry.get("border_margin_px", 10))
         )
+        self.black_min_circularity = float(
+            geometry.get("black_min_circularity", 0.0)
+        )
+        if not 0.0 <= self.black_min_circularity <= 1.0:
+            raise ValueError("black_min_circularity must be in [0, 1]")
         dynamic_roi = color_config.get("dynamic_roi", {})
         self.dynamic_roi_enabled = bool(dynamic_roi.get("enabled", False))
         self.dynamic_roi_margin = max(0, int(dynamic_roi.get("margin_px", 80)))
@@ -131,8 +137,46 @@ class TopViewDetector:
         self._last_color_boxes = {}
         self.color_debug_enabled = False
         self.last_color_debug = None
+        self.last_colors_debug = []
         self.last_color_runtime = None
         self._last_color_filter_stats = None
+
+        # Per-frame white balance. The preliminary rules removed the downward
+        # fill light, so the colour thresholds have to stay valid while the
+        # ambient light changes; see jetson_recognition/illumination.py.
+        self.illumination = WhiteBalanceNormalizer(
+            color_config.get("illumination", {})
+        )
+        self.illumination_enabled = self.illumination.enabled
+        self.last_illumination = None
+        self.last_balanced_frame = None
+        # Blob-level colour decision for the round batch: every material is
+        # classified once from the mean colour of its whole blob instead of
+        # from six independent binary masks.
+        label_config = color_config.get("label_classifier", {})
+        self.label_hue_scale = float(label_config.get("hue_scale", 20.0))
+        self.label_saturation_scale = float(
+            label_config.get("saturation_scale", 60.0)
+        )
+        self.label_value_scale = float(label_config.get("value_scale", 50.0))
+        self.label_center_weight = float(label_config.get("center_weight", 0.05))
+        grouping = color_config.get("material_grouping", {})
+        self.material_merge_distance = max(
+            0.0, float(grouping.get("merge_distance_px", 40.0))
+        )
+        self.material_max_distance = max(
+            0.05,
+            float(
+                grouping.get(
+                    "max_label_distance",
+                    label_config.get("accept_distance", 1.0),
+                )
+            ),
+        )
+        self.material_min_margin = max(
+            0.0, float(grouping.get("min_label_margin", 0.0))
+        )
+        self.last_materials_debug = None
 
         ring_config = config["ring_detection"]
         ring_morphology = ring_config["morphology"]
@@ -164,6 +208,291 @@ class TopViewDetector:
         self.circle_debug_enabled = False
         self.last_circle_debug = None
         self._validate_rois()
+
+    # -- illuminant normalisation -------------------------------------------
+    def _work_frame(self, frame):
+        """Re-expose the frame for the current illuminant before HSV work.
+
+        The original frame is returned whenever no trustworthy white reference
+        is visible, so a dark or unusually colourful scene can never make the
+        detector worse than the plain unnormalised path.
+        """
+        if not self.illumination_enabled:
+            self.last_balanced_frame = None
+            return frame
+        balanced, info = self.illumination.apply(frame)
+        self.last_illumination = info
+        # Kept only so a live window can show what the detector actually sees.
+        self.last_balanced_frame = balanced if balanced is not frame else None
+        return balanced
+
+    # -- blob colour metric -------------------------------------------------
+    @staticmethod
+    def _channel_distance(values, low, high, scale, center_weight):
+        """Distance to one channel box, plus a small pull towards its centre."""
+        low = float(low)
+        high = float(high)
+        scale = max(float(scale), 1e-6)
+        outside = np.maximum(0.0, np.maximum(low - values, values - high)) / scale
+        center = 0.5 * (low + high)
+        return outside + float(center_weight) * np.abs(values - center) / scale
+
+    def _color_distances(self, hue, saturation, value, color_ids):
+        """Metric distance from colour samples to each configured colour.
+
+        The configured HSV ranges double as prototypes: a sample inside a range
+        costs nothing, and the small centre term decides the cases where two
+        ranges overlap (green vs light blue in hue, black vs light blue in
+        value). No hand-labelled training data is needed, and the ranges stay
+        the single place where colour behaviour is tuned.
+        """
+        distances = {}
+        for color_id in [str(item) for item in color_ids]:
+            if color_id == "5":
+                black = self.black_threshold
+                if black is None:
+                    distances[color_id] = None
+                    continue
+                dv = self._channel_distance(
+                    value, 0.0, black["v_max"],
+                    self.label_value_scale, self.label_center_weight,
+                )
+                ds = self._channel_distance(
+                    saturation, black["s_min"], black["s_max"],
+                    self.label_saturation_scale, self.label_center_weight,
+                )
+                distances[color_id] = np.sqrt(dv * dv + ds * ds)
+                continue
+            best = None
+            for lower, upper in self.color_ranges.get(color_id, ()):
+                dh = self._channel_distance(
+                    hue, lower[0], upper[0],
+                    self.label_hue_scale, self.label_center_weight,
+                )
+                ds = self._channel_distance(
+                    saturation, lower[1], upper[1],
+                    self.label_saturation_scale, self.label_center_weight,
+                )
+                dv = self._channel_distance(
+                    value, lower[2], upper[2],
+                    self.label_value_scale, self.label_center_weight,
+                )
+                distance = np.sqrt(dh * dh + ds * ds + dv * dv)
+                best = distance if best is None else np.minimum(best, distance)
+            distances[color_id] = best
+        return distances
+
+    @staticmethod
+    def _contour_mask(contour, box):
+        """Fill one contour into a mask of the given box."""
+        box_x, box_y, width, height = [int(value) for value in box]
+        width = max(1, width)
+        height = max(1, height)
+        local = np.zeros((height, width), dtype=np.uint8)
+        shifted = contour - np.asarray([[[box_x, box_y]]], dtype=contour.dtype)
+        cv2.drawContours(local, [shifted], -1, 255, -1)
+        return local > 0
+
+    @staticmethod
+    def _box_gap(box_a, box_b):
+        """Gap between two boxes; 0 when they touch or overlap."""
+        left_a, top_a, width_a, height_a = box_a
+        left_b, top_b, width_b, height_b = box_b
+        gap_x = max(0, max(left_b - (left_a + width_a), left_a - (left_b + width_b)))
+        gap_y = max(0, max(top_b - (top_a + height_a), top_a - (top_b + height_b)))
+        return float(np.hypot(gap_x, gap_y))
+
+    def _group_summary(self, hsv, masks, members):
+        """Mean colour of one material, measured over the union of its blobs.
+
+        Different colour masks cover slightly different pixels of the same
+        material, so classification uses the union of all of them rather than
+        only the pixels that happened to match one range.
+        """
+        left = int(min(item["box"][0] for item in members))
+        top = int(min(item["box"][1] for item in members))
+        right = int(max(item["box"][0] + item["box"][2] for item in members))
+        bottom = int(max(item["box"][1] + item["box"][3] for item in members))
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+        box = [left, top, width, height]
+        union = np.zeros((height, width), dtype=bool)
+        for item in members:
+            union |= self._contour_mask(item["contour"], box)
+        matched = np.zeros((height, width), dtype=bool)
+        for color_id in sorted({item["color_id"] for item in members}):
+            matched |= masks[color_id][top:top + height, left:left + width] > 0
+        pixels = union & matched
+        count = int(np.count_nonzero(pixels))
+        if count == 0:
+            return None
+        block = hsv[top:top + height, left:left + width]
+        hue = block[..., 0][pixels].astype(np.float32)
+        saturation = block[..., 1][pixels].astype(np.float32)
+        value = block[..., 2][pixels].astype(np.float32)
+        # Circular mean: a red material can sit on both ends of the hue axis.
+        angle = np.deg2rad(hue * 2.0)
+        mean_hue = float(
+            (
+                np.rad2deg(
+                    np.arctan2(np.sin(angle).mean(), np.cos(angle).mean())
+                )
+                % 360.0
+            )
+            / 2.0
+        )
+        rows, columns = np.nonzero(pixels)
+        return {
+            "mean_hsv": [mean_hue, float(saturation.mean()), float(value.mean())],
+            "pixels": count,
+            "inside_px": int(np.count_nonzero(union)),
+            "center_px": [float(left + columns.mean()), float(top + rows.mean())],
+            "box": box,
+        }
+
+    def _materials_in_roi(self, hsv, scene_config, color_ids):
+        """One entry per material: merged blobs plus a per-colour score."""
+        masks = {}
+        members = []
+        filter_stats = {}
+        for color_id in color_ids:
+            mask = self._clean_mask(self._make_color_mask(hsv, color_id))
+            masks[color_id] = mask
+            candidates, _debug, stats = self._filter_candidates(
+                mask, color_id, scene_config, hsv.shape[:2]
+            )
+            filter_stats[color_id] = stats
+            for candidate in candidates:
+                members.append(
+                    {
+                        "color_id": color_id,
+                        "area": candidate[1],
+                        "box": (
+                            candidate[4], candidate[5],
+                            candidate[6], candidate[7],
+                        ),
+                        "contour": candidate[8],
+                    }
+                )
+        # Blue and light blue describe nearly the same pixels of one material,
+        # so merge the blobs of different colours that touch into one material.
+        groups = []
+        for member in sorted(members, key=lambda item: item["area"], reverse=True):
+            for group in groups:
+                gap = min(
+                    self._box_gap(member["box"], item["box"]) for item in group
+                )
+                if gap <= self.material_merge_distance:
+                    group.append(member)
+                    break
+            else:
+                groups.append([member])
+
+        materials = []
+        for group in groups:
+            summary = self._group_summary(hsv, masks, group)
+            if summary is None:
+                continue
+            mean_hue, mean_saturation, mean_value = summary["mean_hsv"]
+            distances = self._color_distances(
+                np.asarray([mean_hue], dtype=np.float32),
+                np.asarray([mean_saturation], dtype=np.float32),
+                np.asarray([mean_value], dtype=np.float32),
+                color_ids,
+            )
+            scores = {}
+            for color_id, distance in distances.items():
+                if distance is None:
+                    continue
+                scores[color_id] = 1.0 / (1.0 + float(distance[0]))
+            if not scores:
+                continue
+            ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+            best_id, best_score = ordered[0]
+            best_distance = 1.0 / max(best_score, 1e-6) - 1.0
+            margin = best_score - ordered[1][1] if len(ordered) > 1 else 1.0
+            if best_distance > self.material_max_distance:
+                continue
+            if self.material_min_margin > 0.0 and margin < self.material_min_margin:
+                continue
+            area = float(sum(item["area"] for item in group))
+            quality = min(1.0, area / max(self.color_min_area * 2.0, 1.0))
+            materials.append(
+                {
+                    "color_id": best_id,
+                    "color_name": self.color_names[best_id],
+                    "confidence": quality * best_score,
+                    "area": area,
+                    "bbox": list(summary["box"]),
+                    "center": summary["center_px"],
+                    "mean_hsv": [round(value, 2) for value in summary["mean_hsv"]],
+                    "distance": best_distance,
+                    "margin": margin,
+                    "scores": scores,
+                    "pixels": summary["pixels"],
+                    "mask_colors": sorted({item["color_id"] for item in group}),
+                    "contours": [item["contour"] for item in group],
+                }
+            )
+        materials.sort(key=lambda item: item["area"], reverse=True)
+        return materials, {
+            "filter_stats": filter_stats,
+            "member_blobs": len(members),
+            "material_count": len(materials),
+            "materials": materials,
+        }
+
+    def detect_materials(self, frame, scene, allowed_ids=None, roi_override=None):
+        """Classify every visible material once: the round-batch entry point.
+
+        A raw-material round carries three materials of three different
+        colours, so the question is not "is this the colour I asked for" but
+        "which colours are these three". Each material is classified from the
+        mean colour of its whole blob, which keeps a glossy edge or a few stray
+        pixels from deciding the label, and ``last_materials_debug`` keeps the
+        per-colour scores so a caller can still solve the batch assignment.
+        """
+        scene = str(scene).upper()
+        scene_config = self.config["scenes"].get(scene)
+        if scene_config is None:
+            raise KeyError("unknown scene: %s" % scene)
+        color_ids = (
+            [self._resolve_color_id(value) for value in allowed_ids]
+            if allowed_ids is not None
+            else sorted(self.color_names)
+        )
+        work = self._work_frame(frame)
+        base_roi = roi_override or scene_config["object_roi"]
+        roi, offset_x, offset_y = _crop(work, base_roi)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        entries, debug = self._materials_in_roi(hsv, scene_config, color_ids)
+        results = []
+        for entry in entries:
+            center_x = entry["center"][0] + offset_x
+            center_y = entry["center"][1] + offset_y
+            entry["center"] = [center_x, center_y]
+            box = entry["bbox"]
+            entry["bbox"] = [
+                box[0] + offset_x, box[1] + offset_y, box[2], box[3],
+            ]
+            entry["contours"] = [
+                contour + np.asarray([[[offset_x, offset_y]]], dtype=contour.dtype)
+                for contour in entry.get("contours", [])
+            ]
+            x, y, unit = self.calibration.map(scene, center_x, center_y)
+            results.append(
+                Measurement(
+                    "COLOR", entry["color_id"], x, y, 0.0,
+                    entry["confidence"], unit, 0.0,
+                    float(center_x), float(center_y),
+                )
+            )
+        debug["scene"] = scene
+        debug["roi"] = _roi_values(base_roi)
+        debug["color_ids"] = list(color_ids)
+        debug["illumination"] = self.last_illumination
+        self.last_materials_debug = debug
+        return results
 
     def set_color_debug(self, enabled):
         self.color_debug_enabled = bool(enabled)
@@ -411,10 +740,8 @@ class TopViewDetector:
         # added after this mask if blue/light-blue HSV ranges truly overlap.
         return mask
 
-    def _color_candidate(self, frame, color_id, roi_rect, scene_config):
-        roi, offset_x, offset_y = _crop(frame, roi_rect)
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        mask = self._make_color_mask(hsv, color_id)
+    def _clean_mask(self, mask):
+        """Apply the configured colour morphology to one binary mask."""
         if self.color_open_iterations:
             mask = cv2.morphologyEx(
                 mask, cv2.MORPH_OPEN, self.color_kernel,
@@ -425,7 +752,13 @@ class TopViewDetector:
                 mask, cv2.MORPH_CLOSE, self.color_kernel,
                 iterations=self.color_close_iterations,
             )
+        return mask
 
+    def _filter_candidates(
+        self, mask, color_id, scene_config, roi_shape,
+        offset_x=0, offset_y=0,
+    ):
+        """Contour, hull and geometry filters shared by every colour path."""
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -453,10 +786,18 @@ class TopViewDetector:
                 continue
             box_x, box_y, width, height = cv2.boundingRect(hull)
             aspect_ratio = float(width) / max(float(height), 1.0)
+            perimeter = float(cv2.arcLength(hull, True))
+            circularity = (
+                4.0 * np.pi * area / (perimeter * perimeter)
+                if perimeter > 0.0 else 0.0
+            )
             if not (
                 self.color_min_aspect_ratio
                 <= aspect_ratio
                 <= self.color_max_aspect_ratio
+            ) or (
+                color_id == "5"
+                and circularity < self.black_min_circularity
             ):
                 filter_stats["shape_rejected"] += 1
                 continue
@@ -464,8 +805,8 @@ class TopViewDetector:
             if (
                 box_x <= margin
                 or box_y <= margin
-                or box_x + width >= roi.shape[1] - margin
-                or box_y + height >= roi.shape[0] - margin
+                or box_x + width >= roi_shape[1] - margin
+                or box_y + height >= roi_shape[0] - margin
             ):
                 # A clipped target has an unreliable center and should never
                 # be handed to the gripper, regardless of its color.
@@ -481,7 +822,7 @@ class TopViewDetector:
             global_box = [box_x + offset_x, box_y + offset_y, width, height]
             candidate = (
                 confidence, area, center_x, center_y,
-                global_box[0], global_box[1], width, height,
+                global_box[0], global_box[1], width, height, hull,
             )
             candidates.append(candidate)
             filter_stats["accepted"] += 1
@@ -496,11 +837,36 @@ class TopViewDetector:
                         "center": [float(center_x), float(center_y)],
                         "area": area,
                         "aspect_ratio": aspect_ratio,
+                        "circularity": circularity,
                         "quality": confidence,
                         "accepted": True,
                     }
                 )
 
+        return candidates, debug_candidates, filter_stats
+
+    def _color_candidate(
+        self, frame, color_id, roi_rect, scene_config, prepared_hsv=None,
+        mask_override=None,
+    ):
+        if prepared_hsv is None:
+            roi, offset_x, offset_y = _crop(frame, roi_rect)
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        else:
+            hsv, offset_x, offset_y = prepared_hsv
+            # Only the dimensions are used below for border rejection.
+            roi = hsv
+        if mask_override is None:
+            mask = self._make_color_mask(hsv, color_id)
+        else:
+            # Mutually exclusive label mask: another colour already claimed
+            # these pixels, which is how blue/light-blue and black/shadow stop
+            # producing two detections of the same material.
+            mask = mask_override
+        mask = self._clean_mask(mask)
+        candidates, debug_candidates, filter_stats = self._filter_candidates(
+            mask, color_id, scene_config, roi.shape[:2], offset_x, offset_y
+        )
         self._last_color_filter_stats = filter_stats
         selected = max(candidates, key=lambda item: item[1]) if candidates else None
         if self.color_debug_enabled:
@@ -529,6 +895,7 @@ class TopViewDetector:
         scene_config = self.config["scenes"].get(scene)
         if scene_config is None:
             raise KeyError("unknown scene: %s" % scene)
+        work = self._work_frame(frame)
         base_roi = roi_override or scene_config["object_roi"]
         key = (str(kind).upper(), color_id, scene)
         candidate = None
@@ -543,7 +910,7 @@ class TopViewDetector:
                 base_roi, self._last_color_boxes[key]
             )
             candidate = self._color_candidate(
-                frame, color_id, active_roi, scene_config
+                work, color_id, active_roi, scene_config
             )
             if candidate is not None:
                 roi_mode = "DYNAMIC_ROI"
@@ -552,7 +919,7 @@ class TopViewDetector:
                 self._dynamic_roi_active.discard(key)
             active_roi = base_roi
             candidate = self._color_candidate(
-                frame, color_id, base_roi, scene_config
+                work, color_id, base_roi, scene_config
             )
         self.last_color_runtime = {
             "mode": roi_mode,
@@ -565,7 +932,7 @@ class TopViewDetector:
         if candidate is None:
             self._last_color_boxes.pop(key, None)
             return None
-        confidence, _, x_px, y_px, box_x, box_y, width, height = candidate
+        confidence, _, x_px, y_px, box_x, box_y, width, height, _hull = candidate
         self._last_color_boxes[key] = [box_x, box_y, width, height]
         x, y, unit = self.calibration.map(scene, x_px, y_px)
         return Measurement(
@@ -585,14 +952,74 @@ class TopViewDetector:
             if allowed_ids is not None
             else sorted(self.color_ranges)
         )
-        results = []
-        for color_id in color_ids:
-            measurement = self.detect_color(frame, color_id, scene)
-            if measurement is not None:
-                results.append(measurement)
+        results = self.detect_colors(frame, scene, color_ids)
         if not results:
             return None
         return max(results, key=lambda item: item.confidence)
+
+    def detect_colors(self, frame, scene, allowed_ids=None):
+        """Return one strongest measurement for every visible allowed color."""
+        scene = str(scene).upper()
+        scene_config = self.config["scenes"].get(scene)
+        if scene_config is None:
+            raise KeyError("unknown scene: %s" % scene)
+        color_ids = (
+            [self._resolve_color_id(value) for value in allowed_ids]
+            if allowed_ids is not None
+            else sorted(self.color_ranges)
+        )
+        # A dynamic ROI can differ for each tracked color, so retain the
+        # single-color path when that optional mode is active. Competition
+        # uses the full search ROI: crop and convert it to HSV once, then
+        # reuse it for every requested color.
+        if self.dynamic_roi_enabled:
+            results = []
+            debug_results = []
+            for color_id in color_ids:
+                measurement = self.detect_color(frame, color_id, scene)
+                if self.color_debug_enabled and self.last_color_debug is not None:
+                    debug_results.append(self.last_color_debug)
+                if measurement is not None:
+                    results.append(measurement)
+            self.last_colors_debug = debug_results
+            return results
+
+        base_roi = scene_config["object_roi"]
+        work = self._work_frame(frame)
+        roi, offset_x, offset_y = _crop(work, base_roi)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        prepared_hsv = (hsv, offset_x, offset_y)
+        results = []
+        debug_results = []
+        filter_stats = {}
+        for color_id in color_ids:
+            candidate = self._color_candidate(
+                work, color_id, base_roi, scene_config, prepared_hsv=prepared_hsv
+            )
+            if self.color_debug_enabled and self.last_color_debug is not None:
+                debug_results.append(self.last_color_debug)
+            filter_stats[color_id] = dict(self._last_color_filter_stats or {})
+            key = ("COLOR", color_id, scene)
+            if candidate is None:
+                self._last_color_boxes.pop(key, None)
+                continue
+            confidence, _, x_px, y_px, box_x, box_y, width, height, _hull = candidate
+            self._last_color_boxes[key] = [box_x, box_y, width, height]
+            x, y, unit = self.calibration.map(scene, x_px, y_px)
+            results.append(
+                Measurement(
+                    "COLOR", color_id, x, y, 0.0, confidence, unit, 0.0,
+                    float(x_px), float(y_px),
+                )
+            )
+        self.last_color_runtime = {
+            "mode": "SHARED_FIXED_ROI",
+            "roi": _roi_values(base_roi),
+            "base_roi": _roi_values(base_roi),
+            "filter_stats_by_color": filter_stats,
+        }
+        self.last_colors_debug = debug_results
+        return results
 
     def _detect_circle_in_roi(self, frame, roi_rect, parameters):
         roi, offset_x, offset_y = _crop(frame, roi_rect)

@@ -25,6 +25,7 @@ DEFAULT_STATE = Path("/tmp/standalone-vision-disk-guard.json")
 UVCDYNCTRL_LOG = Path("/var/log/uvcdynctrl-udev.log")
 # The udev helper itself; debug=0 makes it write to /dev/null instead.
 UVCDYNCTRL_HELPER = Path("/lib/udev/uvcdynctrl")
+UVCDYNCTRL_RULE_MASK = Path("/etc/udev/rules.d/80-uvcdynctrl.rules")
 LOGROTATE_CONFIG = Path("/etc/logrotate.d/uvcdynctrl-udev")
 DISK_GUARD_TIMER = "disk-guard.timer"
 
@@ -65,6 +66,10 @@ def guard_state():
     return {
         "uvcdynctrl_debug": debug,
         "uvcdynctrl_log_disabled": debug == "0",
+        "uvcdynctrl_rule_disabled": (
+            UVCDYNCTRL_RULE_MASK.is_symlink()
+            and str(UVCDYNCTRL_RULE_MASK.resolve()) == "/dev/null"
+        ),
         "logrotate_installed": logrotate_installed,
         "logrotate_config": LOGROTATE_CONFIG.exists(),
         "disk_guard_timer_active": timer_active,
@@ -141,6 +146,12 @@ def sample(path=UVCDYNCTRL_LOG, root="/", state_path=DEFAULT_STATE,
             "the UVC udev helper still logs (debug=%s); the log grows on every "
             "video4linux add event - run: sudo bash tools/install_log_guard.sh"
             % guard["uvcdynctrl_debug"]
+        )
+    if not guard["uvcdynctrl_rule_disabled"]:
+        severity = max(severity, 1)
+        findings.append(
+            "the legacy uvcdynctrl udev rule still queries every new UVC node; "
+            "run: sudo bash tools/install_log_guard.sh"
         )
     timer_state = guard["disk_guard_timer_active"]
     if timer_state not in ("active", "unknown"):
