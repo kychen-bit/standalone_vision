@@ -279,6 +279,10 @@ def main():
         help="where the diagnosis frame and mask montage are written",
     )
     parser.add_argument(
+        "--camera-profile",
+        help="override camera.v4l2_control_profile, e.g. fill_light_locked / dim_room_locked",
+    )
+    parser.add_argument(
         "--capture-profile",
         help="override camera.capture_profile, e.g. wide_4_3 to compare fields of view",
     )
@@ -343,6 +347,10 @@ def main():
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if arguments.fill_light is not None:
         config.setdefault("lighting", {})["fill_light"] = bool(arguments.fill_light)
+    if arguments.camera_profile:
+        # Must be set before build_engine: the camera is opened with this and
+        # the startup log then reports the profile that is actually applied.
+        config["camera"]["v4l2_control_profile"] = arguments.camera_profile
     # Follow the configured frame size instead of a hard-coded 1280x720 centre,
     # so a capture-mode change does not silently move the reference point.
     apply_capture_profile(config["camera"], arguments.capture_profile)

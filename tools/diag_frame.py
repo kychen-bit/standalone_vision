@@ -71,6 +71,9 @@ def main():
             raise SystemExit("no frame from the camera")
 
     colors = sorted(detector.color_ranges)
+    # Run the real decision first: diagnose() reports what the detector
+    # rejected, so it needs last_materials_debug to be populated.
+    detector.detect_materials(frame, "TURNTABLE", colors)
     diagnose(
         detector, frame, colors, COLOR_NAMES, PROJECT_ROOT / arguments.out,
     )
