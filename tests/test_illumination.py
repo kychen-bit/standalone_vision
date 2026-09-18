@@ -35,7 +35,11 @@ POSITIONS = {
 
 
 def load_config():
-    return json.loads((ROOT / "config" / "jetson.json").read_text(encoding="utf-8"))
+    config = json.loads((ROOT / "config" / "jetson.json").read_text(encoding="utf-8"))
+    # The shipped turntable area limits are tuned to the real rig. These tests
+    # are about colour and illumination, so make them size-independent.
+    config["scenes"]["TURNTABLE"].update({"min_area": 300, "max_area": 500000})
+    return config
 
 
 def hsv_bgr(h, s, v):

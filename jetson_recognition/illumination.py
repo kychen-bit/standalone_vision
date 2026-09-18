@@ -60,6 +60,13 @@ class WhiteBalanceNormalizer:
         self.gain_epsilon = min(
             0.5, max(0.0, float(config.get("gain_epsilon", 0.02)))
         )
+        # White-balancing is not an exposure control: a frame that needs a
+        # large gain is underexposed, and amplifying it only amplifies noise.
+        # These two bounds turn that into an explicit operator hint.
+        self.exposure_gain_min = max(0.1, float(config.get("exposure_gain_min", 0.90)))
+        self.exposure_gain_max = max(
+            self.exposure_gain_min, float(config.get("exposure_gain_max", 1.60))
+        )
         self.hold_jump_ratio = max(1.0, float(config.get("hold_jump_ratio", 1.6)))
         self.estimate_width = max(32, int(config.get("estimate_width", 256)))
         self.reference = None
@@ -80,6 +87,7 @@ class WhiteBalanceNormalizer:
             "gain_limited": False,
             "reference_mode": None,
             "clipped_ratio": 0.0,
+            "exposure_hint": "UNKNOWN",
         }
 
     def reset(self):
@@ -108,6 +116,7 @@ class WhiteBalanceNormalizer:
             "gain_limited": False,
             "reference_mode": None,
             "clipped_ratio": 0.0,
+            "exposure_hint": "UNKNOWN",
         }
         neutral = None
         # A warm or cool lamp tints even a white surface, so the strict chroma
@@ -141,6 +150,7 @@ class WhiteBalanceNormalizer:
             # gain derived from it would shift hues. Leave the frame alone and
             # tell the operator to lower the exposure instead.
             info["reason"] = "WHITE_FIELD_CLIPPED"
+            info["exposure_hint"] = "LOWER_EXPOSURE"
             return None, info
         mask = neutral.astype(np.uint8) * 255
         reference = np.empty(3, dtype=np.float32)
@@ -152,6 +162,7 @@ class WhiteBalanceNormalizer:
             )
         if float(reference.min()) < self.min_level:
             info["reason"] = "REFERENCE_TOO_DARK"
+            info["exposure_hint"] = "RAISE_EXPOSURE"
             return None, info
         info["reason"] = "OK"
         return reference, info
@@ -217,6 +228,13 @@ class WhiteBalanceNormalizer:
         gain = np.clip(gain, 0.05, self.max_gain)
         self.gain = gain.astype(np.float32)
         balanced = self._balance(frame, self.gain)
+        average_gain = float(self.gain.mean())
+        if limited or average_gain > self.exposure_gain_max:
+            hint = "RAISE_EXPOSURE"
+        elif average_gain < self.exposure_gain_min:
+            hint = "LOWER_EXPOSURE"
+        else:
+            hint = "OK"
 
         self.last = {
             "enabled": True,
@@ -231,6 +249,7 @@ class WhiteBalanceNormalizer:
             "gain_limited": limited,
             "reference_mode": info.get("reference_mode"),
             "clipped_ratio": info.get("clipped_ratio", 0.0),
+            "exposure_hint": hint,
         }
         return balanced, self.last
 

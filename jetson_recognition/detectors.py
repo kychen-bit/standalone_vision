@@ -125,6 +125,33 @@ class TopViewDetector:
         self.color_border_margin = max(
             0, int(geometry.get("border_margin_px", 10))
         )
+        # Extra shape gates. Glare cuts notches into a material mask, so these
+        # stay lenient by default; they are there to reject coloured markings,
+        # long strips, shadows and split reflections rather than real parts.
+        # mass_ratio counts the real mask pixels inside the hull, so unlike
+        # solidity it also catches a hollow blob (a painted ring, a blown-out
+        # specular hole) whose outline is perfectly round.
+        self.color_min_mass_ratio = float(geometry.get("min_mass_ratio", 0.35))
+        self.color_min_fill_ratio = float(geometry.get("min_fill_ratio", 0.0))
+        # Contour circularity finally rejects torn shadows and crescents: the
+        # hull version is ~1 for anything convex, so it never filtered them.
+        self.color_min_contour_circularity = float(
+            geometry.get("min_contour_circularity", 0.0)
+        )
+        # A blob with a bigger hole than this is rejected unless another blob
+        # fills that hole (see the frustum ring rule in _materials_in_roi).
+        # Absent in the config means the gate is off.
+        hole_limit = geometry.get("max_hole_ratio")
+        self.color_max_hole_ratio = (
+            1.0 if hole_limit is None else float(hole_limit)
+        )
+        grouping_config = color_config.get("material_grouping", {})
+        self.material_ring_hole_ratio = float(
+            grouping_config.get("ring_hole_ratio", 0.25)
+        )
+        self.material_ring_margin_px = float(
+            grouping_config.get("ring_margin_px", 10.0)
+        )
         self.black_min_circularity = float(
             geometry.get("black_min_circularity", 0.0)
         )
@@ -147,6 +174,14 @@ class TopViewDetector:
         self.illumination = WhiteBalanceNormalizer(
             color_config.get("illumination", {})
         )
+        # ``lighting.fill_light`` is the competition-level switch: with the
+        # downward fill light present the illumination is stable, so the locked
+        # camera profile and the field-tuned HSV ranges are used unchanged.
+        # Without it every frame has to be white-balanced before thresholding.
+        fill_light = config.get("lighting", {}).get("fill_light")
+        self.fill_light = None if fill_light is None else bool(fill_light)
+        if self.fill_light is True:
+            self.illumination.enabled = False
         self.illumination_enabled = self.illumination.enabled
         self.last_illumination = None
         self.last_balanced_frame = None
@@ -160,6 +195,21 @@ class TopViewDetector:
         )
         self.label_value_scale = float(label_config.get("value_scale", 50.0))
         self.label_center_weight = float(label_config.get("center_weight", 0.05))
+        self.prototype_core_ratio = min(
+            1.0, max(0.1, float(label_config.get("prototype_core_ratio", 0.6)))
+        )
+        # Optional per-colour calibration point measured on the real material,
+        # e.g. copied from the live tool's ``core_hsv``. When present it
+        # replaces the centre of the HSV range as the classification prototype.
+        self.color_prototypes = {}
+        for color_id, definition in config["colors"].items():
+            prototype = definition.get("prototype_hsv")
+            if not prototype:
+                continue
+            values = [float(item) for item in prototype]
+            if len(values) != 3:
+                raise ValueError("colors.%s.prototype_hsv needs H, S, V" % color_id)
+            self.color_prototypes[str(color_id)] = values
         grouping = color_config.get("material_grouping", {})
         self.material_merge_distance = max(
             0.0, float(grouping.get("merge_distance_px", 40.0))
@@ -248,6 +298,25 @@ class TopViewDetector:
         """
         distances = {}
         for color_id in [str(item) for item in color_ids]:
+            prototype = self.color_prototypes.get(color_id)
+            if prototype is not None:
+                ds = (
+                    np.abs(saturation - prototype[1])
+                    / max(self.label_saturation_scale, 1e-6)
+                )
+                dv = (
+                    np.abs(value - prototype[2])
+                    / max(self.label_value_scale, 1e-6)
+                )
+                if color_id == "5":
+                    # Hue is meaningless for a neutral-dark material.
+                    distances[color_id] = np.sqrt(ds * ds + dv * dv)
+                    continue
+                dh = self._hue_delta(hue, prototype[0]) / max(
+                    self.label_hue_scale, 1e-6
+                )
+                distances[color_id] = np.sqrt(dh * dh + ds * ds + dv * dv)
+                continue
             if color_id == "5":
                 black = self.black_threshold
                 if black is None:
@@ -283,6 +352,12 @@ class TopViewDetector:
         return distances
 
     @staticmethod
+    def _hue_delta(hue, reference):
+        """Shortest distance between two hues on the 0..179 OpenCV circle."""
+        difference = np.abs(hue - float(reference))
+        return np.minimum(difference, 180.0 - difference)
+
+    @staticmethod
     def _contour_mask(contour, box):
         """Fill one contour into a mask of the given box."""
         box_x, box_y, width, height = [int(value) for value in box]
@@ -292,6 +367,15 @@ class TopViewDetector:
         shifted = contour - np.asarray([[[box_x, box_y]]], dtype=contour.dtype)
         cv2.drawContours(local, [shifted], -1, 255, -1)
         return local > 0
+
+    @staticmethod
+    def _box_contains(box, point, margin=0.0):
+        """True when the point sits inside the box, grown by ``margin``."""
+        left, top, width, height = box
+        return bool(
+            left - margin <= point[0] <= left + width + margin
+            and top - margin <= point[1] <= top + height + margin
+        )
 
     @staticmethod
     def _box_gap(box_a, box_b):
@@ -327,12 +411,47 @@ class TopViewDetector:
         if count == 0:
             return None
         block = hsv[top:top + height, left:left + width]
-        hue = block[..., 0][pixels].astype(np.float32)
-        saturation = block[..., 1][pixels].astype(np.float32)
-        value = block[..., 2][pixels].astype(np.float32)
-        # Circular mean: a red material can sit on both ends of the hue axis.
+        rows, columns = np.nonzero(pixels)
+        hue_pixels = block[..., 0][pixels].astype(np.float32)
+        saturation_pixels = block[..., 1][pixels].astype(np.float32)
+        value_pixels = block[..., 2][pixels].astype(np.float32)
+        center_x = float(left + columns.mean())
+        center_y = float(top + rows.mean())
+        # Classify from the inner part of the blob: the rim carries glare,
+        # background bleed and demosaic artefacts, and they pull the average
+        # colour away from what the material actually is.
+        core_radius = max(
+            2.0,
+            float(np.sqrt(count / np.pi)) * self.prototype_core_ratio,
+        )
+        offset_x = columns + left - center_x
+        offset_y = rows + top - center_y
+        core = (offset_x * offset_x + offset_y * offset_y) <= core_radius * core_radius
+        if int(np.count_nonzero(core)) < max(16, count // 10):
+            core = np.ones(count, dtype=bool)
+        return {
+            "mean_hsv": [
+                self._circular_hue_mean(hue_pixels),
+                float(saturation_pixels.mean()),
+                float(value_pixels.mean()),
+            ],
+            "core_hsv": [
+                self._circular_hue_mean(hue_pixels[core]),
+                float(saturation_pixels[core].mean()),
+                float(value_pixels[core].mean()),
+            ],
+            "core_pixels": int(np.count_nonzero(core)),
+            "pixels": count,
+            "inside_px": int(np.count_nonzero(union)),
+            "center_px": [center_x, center_y],
+            "box": box,
+        }
+
+    @staticmethod
+    def _circular_hue_mean(hue):
+        """Hue mean that survives the wrap at 0/179 (a red material uses both ends)."""
         angle = np.deg2rad(hue * 2.0)
-        mean_hue = float(
+        return float(
             (
                 np.rad2deg(
                     np.arctan2(np.sin(angle).mean(), np.cos(angle).mean())
@@ -341,14 +460,6 @@ class TopViewDetector:
             )
             / 2.0
         )
-        rows, columns = np.nonzero(pixels)
-        return {
-            "mean_hsv": [mean_hue, float(saturation.mean()), float(value.mean())],
-            "pixels": count,
-            "inside_px": int(np.count_nonzero(union)),
-            "center_px": [float(left + columns.mean()), float(top + rows.mean())],
-            "box": box,
-        }
 
     def _materials_in_roi(self, hsv, scene_config, color_ids):
         """One entry per material: merged blobs plus a per-colour score."""
@@ -366,18 +477,58 @@ class TopViewDetector:
                 members.append(
                     {
                         "color_id": color_id,
-                        "area": candidate[1],
-                        "box": (
-                            candidate[4], candidate[5],
-                            candidate[6], candidate[7],
-                        ),
-                        "contour": candidate[8],
+                        "area": candidate["area"],
+                        "box": tuple(candidate["box"]),
+                        "contour": candidate["contour"],
+                        "solidity": candidate["solidity"],
+                        "mass_ratio": candidate["mass_ratio"],
+                        "fill_ratio": candidate["fill_ratio"],
+                        "circularity": candidate["circularity"],
+                        "contour_circularity": candidate["contour_circularity"],
+                        "hole_area": candidate["hole_area"],
+                        "hole_ratio": candidate["hole_ratio"],
+                        "hole_center": candidate["hole_center"],
+                        "equivalent_diameter": candidate["equivalent_diameter"],
                     }
                 )
+        # The material is a frustum: seen from above it is a filled disc of the
+        # part colour, while the shaded conical face often matches a *different*
+        # colour range and appears as a ring around it. A ring is not a material
+        # of its own: if its hole contains another blob, they are one part.
+        explained = []
+        for member in members:
+            if member["hole_ratio"] < self.material_ring_hole_ratio:
+                continue
+            center = member["hole_center"]
+            if center is None:
+                continue
+            for other in members:
+                if other is member:
+                    continue
+                if not self._box_contains(other["box"], center, self.material_ring_margin_px):
+                    continue
+                if other["area"] < 0.25 * member["hole_area"]:
+                    continue
+                explained.append(
+                    {
+                        "color_id": member["color_id"],
+                        "area": member["area"],
+                        "hole_ratio": round(member["hole_ratio"], 3),
+                        "explained_by": other["color_id"],
+                        "host_area": other["area"],
+                    }
+                )
+                member["ring_only"] = True
+                break
+
         # Blue and light blue describe nearly the same pixels of one material,
         # so merge the blobs of different colours that touch into one material.
         groups = []
-        for member in sorted(members, key=lambda item: item["area"], reverse=True):
+        for member in sorted(
+            (item for item in members if not item.get("ring_only")),
+            key=lambda item: item["area"],
+            reverse=True,
+        ):
             for group in groups:
                 gap = min(
                     self._box_gap(member["box"], item["box"]) for item in group
@@ -393,7 +544,7 @@ class TopViewDetector:
             summary = self._group_summary(hsv, masks, group)
             if summary is None:
                 continue
-            mean_hue, mean_saturation, mean_value = summary["mean_hsv"]
+            mean_hue, mean_saturation, mean_value = summary["core_hsv"]
             distances = self._color_distances(
                 np.asarray([mean_hue], dtype=np.float32),
                 np.asarray([mean_saturation], dtype=np.float32),
@@ -417,6 +568,7 @@ class TopViewDetector:
                 continue
             area = float(sum(item["area"] for item in group))
             quality = min(1.0, area / max(self.color_min_area * 2.0, 1.0))
+            representative = group[0]
             materials.append(
                 {
                     "color_id": best_id,
@@ -426,10 +578,23 @@ class TopViewDetector:
                     "bbox": list(summary["box"]),
                     "center": summary["center_px"],
                     "mean_hsv": [round(value, 2) for value in summary["mean_hsv"]],
+                    "core_hsv": [round(value, 2) for value in summary["core_hsv"]],
                     "distance": best_distance,
                     "margin": margin,
                     "scores": scores,
                     "pixels": summary["pixels"],
+                    "core_pixels": summary["core_pixels"],
+                    "solidity": round(float(representative["solidity"]), 3),
+                    "mass_ratio": round(float(representative["mass_ratio"]), 3),
+                    "fill_ratio": round(float(representative["fill_ratio"]), 3),
+                    "circularity": round(float(representative["circularity"]), 3),
+                    "contour_circularity": round(
+                        float(representative["contour_circularity"]), 3
+                    ),
+                    "hole_ratio": round(float(representative["hole_ratio"]), 3),
+                    "equivalent_diameter": round(
+                        float(representative["equivalent_diameter"]), 1
+                    ),
                     "mask_colors": sorted({item["color_id"] for item in group}),
                     "contours": [item["contour"] for item in group],
                 }
@@ -439,6 +604,7 @@ class TopViewDetector:
             "filter_stats": filter_stats,
             "member_blobs": len(members),
             "material_count": len(materials),
+            "rings_explained": explained,
             "materials": materials,
         }
 
@@ -758,10 +924,27 @@ class TopViewDetector:
         self, mask, color_id, scene_config, roi_shape,
         offset_x=0, offset_y=0,
     ):
-        """Contour, hull and geometry filters shared by every colour path."""
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        """Contour, hull and shape filters shared by every colour path.
+
+        Candidates are dicts so adding a metric never renumbers a positional
+        tuple. Keys: ``confidence, area`` (hull), ``contour_area`` (true
+        polygon), ``center, box, contour, aspect_ratio, circularity`` (hull),
+        ``contour_circularity, solidity, mass_ratio, fill_ratio, hole_area,
+        hole_ratio, hole_center, equivalent_diameter``.
+
+        Holes are tracked because the real material is a frustum: seen from
+        above it is a filled disc of the material colour, while the shaded
+        conical face often matches a *different* colour range and shows up as a
+        ring around it. A ring has a hole, a material does not.
+        """
+        contours, hierarchy = cv2.findContours(
+            mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
         )
+        holes = {}
+        for index in range(len(contours)):
+            parent = -1 if hierarchy is None else int(hierarchy[0][index][3])
+            if parent >= 0:
+                holes.setdefault(parent, []).append(contours[index])
         minimum = float(scene_config.get("min_area", self.color_min_area))
         maximum_value = scene_config.get("max_area", self.color_max_area)
         maximum = float(maximum_value) if maximum_value is not None else float("inf")
@@ -769,13 +952,24 @@ class TopViewDetector:
             "raw_contours": len(contours),
             "area_rejected": 0,
             "shape_rejected": 0,
+            "round_rejected": 0,
+            "mass_rejected": 0,
+            "fill_rejected": 0,
+            "hole_rejected": 0,
             "border_rejected": 0,
             "accepted": 0,
             "area_limits_px": [minimum, maximum if np.isfinite(maximum) else None],
+            "min_contour_circularity": round(
+                self.color_min_contour_circularity, 3
+            ),
+            "max_hole_ratio": round(self.color_max_hole_ratio, 3),
         }
         candidates = []
         debug_candidates = []
-        for contour in contours:
+        for index, contour in enumerate(contours):
+            if hierarchy is not None and int(hierarchy[0][index][3]) >= 0:
+                # A hole; it is accounted for through its parent contour.
+                continue
             # The real material is rotationally symmetric. Using its convex
             # outer silhouette keeps the center stable when glare removes a
             # notch from the color mask, without adding contour clustering.
@@ -791,6 +985,42 @@ class TopViewDetector:
                 4.0 * np.pi * area / (perimeter * perimeter)
                 if perimeter > 0.0 else 0.0
             )
+            contour_area = float(cv2.contourArea(contour))
+            contour_perimeter = float(cv2.arcLength(contour, True))
+            # Hull circularity is ~1 for anything convex, so it cannot reject a
+            # torn shadow or a crescent. The contour itself can.
+            contour_circularity = (
+                4.0 * np.pi * contour_area / (contour_perimeter * contour_perimeter)
+                if contour_perimeter > 0.0 else 0.0
+            )
+            solidity = contour_area / area if area > 0.0 else 0.0
+            _center, circle_radius = cv2.minEnclosingCircle(hull)
+            circle_area = float(np.pi) * float(circle_radius) ** 2
+            fill_ratio = area / circle_area if circle_area > 0.0 else 0.0
+            # Real mask pixels inside the hull. A hollow or fragmented blob
+            # keeps its round outline, so this metric falls for those.
+            local = np.zeros((height, width), dtype=np.uint8)
+            shifted = hull - np.asarray([[[box_x, box_y]]], dtype=hull.dtype)
+            cv2.drawContours(local, [shifted], -1, 255, -1)
+            patch = mask[box_y:box_y + height, box_x:box_x + width]
+            mass = float(np.count_nonzero(cv2.bitwise_and(patch, local)))
+            mass_ratio = mass / area if area > 0.0 else 0.0
+            hole_area = 0.0
+            hole_center = None
+            for hole in holes.get(index, ()):
+                current = float(cv2.contourArea(hole))
+                if current <= hole_area:
+                    continue
+                moments = cv2.moments(hole)
+                if moments["m00"] <= 0:
+                    continue
+                hole_area = current
+                hole_center = [
+                    moments["m10"] / moments["m00"] + offset_x,
+                    moments["m01"] / moments["m00"] + offset_y,
+                ]
+            hole_ratio = hole_area / contour_area if contour_area > 0.0 else 0.0
+            equivalent_diameter = 2.0 * float(np.sqrt(area / np.pi))
             if not (
                 self.color_min_aspect_ratio
                 <= aspect_ratio
@@ -800,6 +1030,18 @@ class TopViewDetector:
                 and circularity < self.black_min_circularity
             ):
                 filter_stats["shape_rejected"] += 1
+                continue
+            if contour_circularity < self.color_min_contour_circularity:
+                filter_stats["round_rejected"] += 1
+                continue
+            if mass_ratio < self.color_min_mass_ratio:
+                filter_stats["mass_rejected"] += 1
+                continue
+            if fill_ratio < self.color_min_fill_ratio:
+                filter_stats["fill_rejected"] += 1
+                continue
+            if hole_ratio > self.color_max_hole_ratio:
+                filter_stats["hole_rejected"] += 1
                 continue
             margin = self.color_border_margin
             if (
@@ -820,28 +1062,50 @@ class TopViewDetector:
             center_y = moments["m01"] / moments["m00"] + offset_y
             confidence = min(1.0, area / max(minimum * 2.0, 1.0))
             global_box = [box_x + offset_x, box_y + offset_y, width, height]
-            candidate = (
-                confidence, area, center_x, center_y,
-                global_box[0], global_box[1], width, height, hull,
-            )
+            candidate = {
+                "confidence": confidence,
+                "area": area,
+                "center": [float(center_x), float(center_y)],
+                "box": global_box,
+                "contour": hull,
+                "contour_area": contour_area,
+                "aspect_ratio": aspect_ratio,
+                "circularity": circularity,
+                "contour_circularity": contour_circularity,
+                "solidity": solidity,
+                "mass_ratio": mass_ratio,
+                "fill_ratio": fill_ratio,
+                "hole_area": hole_area,
+                "hole_ratio": hole_ratio,
+                "hole_center": hole_center,
+                "equivalent_diameter": equivalent_diameter,
+                "color_id": color_id,
+            }
             candidates.append(candidate)
             filter_stats["accepted"] += 1
             if self.color_debug_enabled:
                 global_contour = hull + np.asarray(
                     [[[offset_x, offset_y]]], dtype=contour.dtype
                 )
-                debug_candidates.append(
-                    {
-                        "bbox": global_box,
-                        "contour": global_contour,
-                        "center": [float(center_x), float(center_y)],
-                        "area": area,
-                        "aspect_ratio": aspect_ratio,
-                        "circularity": circularity,
-                        "quality": confidence,
-                        "accepted": True,
-                    }
-                )
+                debug_candidate = {
+                    "bbox": global_box,
+                    "contour": global_contour,
+                    "center": [float(center_x), float(center_y)],
+                    "area": area,
+                    "contour_area": contour_area,
+                    "aspect_ratio": aspect_ratio,
+                    "circularity": circularity,
+                    "contour_circularity": contour_circularity,
+                    "solidity": solidity,
+                    "mass_ratio": mass_ratio,
+                    "fill_ratio": fill_ratio,
+                    "hole_ratio": hole_ratio,
+                    "equivalent_diameter": equivalent_diameter,
+                    "quality": confidence,
+                    "accepted": True,
+                }
+                debug_candidates.append(debug_candidate)
+                candidate["debug"] = debug_candidate
 
         return candidates, debug_candidates, filter_stats
 
@@ -868,17 +1132,9 @@ class TopViewDetector:
             mask, color_id, scene_config, roi.shape[:2], offset_x, offset_y
         )
         self._last_color_filter_stats = filter_stats
-        selected = max(candidates, key=lambda item: item[1]) if candidates else None
+        selected = max(candidates, key=lambda item: item["area"]) if candidates else None
         if self.color_debug_enabled:
-            selected_debug = None
-            if selected is not None:
-                selected_debug = min(
-                    debug_candidates,
-                    key=lambda item: (
-                        abs(item["center"][0] - selected[2])
-                        + abs(item["center"][1] - selected[3])
-                    ),
-                )
+            selected_debug = selected.get("debug") if selected is not None else None
             self.last_color_debug = {
                 "requested_id": color_id,
                 "color_name": self.color_names[color_id],
@@ -932,8 +1188,10 @@ class TopViewDetector:
         if candidate is None:
             self._last_color_boxes.pop(key, None)
             return None
-        confidence, _, x_px, y_px, box_x, box_y, width, height, _hull = candidate
-        self._last_color_boxes[key] = [box_x, box_y, width, height]
+        confidence = candidate["confidence"]
+        x_px, y_px = candidate["center"]
+        box_x, box_y, width, height = candidate["box"]
+        self._last_color_boxes[key] = [int(box_x), int(box_y), int(width), int(height)]
         x, y, unit = self.calibration.map(scene, x_px, y_px)
         return Measurement(
             kind, color_id, x, y, 0.0, confidence, unit, 0.0,
@@ -1003,8 +1261,12 @@ class TopViewDetector:
             if candidate is None:
                 self._last_color_boxes.pop(key, None)
                 continue
-            confidence, _, x_px, y_px, box_x, box_y, width, height, _hull = candidate
-            self._last_color_boxes[key] = [box_x, box_y, width, height]
+            confidence = candidate["confidence"]
+            x_px, y_px = candidate["center"]
+            box_x, box_y, width, height = candidate["box"]
+            self._last_color_boxes[key] = [
+                int(box_x), int(box_y), int(width), int(height)
+            ]
             x, y, unit = self.calibration.map(scene, x_px, y_px)
             results.append(
                 Measurement(
