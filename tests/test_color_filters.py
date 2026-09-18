@@ -109,6 +109,84 @@ class ShapeGateTests(unittest.TestCase):
             self.assertGreater(entry["core_pixels"], 100)
 
 
+class GlareTests(unittest.TestCase):
+    """A hard lamp puts a blown-out spot on the top face of the material."""
+
+    MATERIAL = (170, 230, 200)     # saturated red-pink, inside colors.1
+    HIGHLIGHT = (170, 150, 250)    # same hue but washed out by the lamp
+
+    def _frame_with_center_highlight(self):
+        frame = empty_scene()
+        cv2.circle(frame, (640, 360), 100, hsv_bgr(*self.MATERIAL), -1)
+        cv2.circle(frame, (640, 360), 28, hsv_bgr(*self.HIGHLIGHT), -1)
+        return frame
+
+    def test_annulus_core_skips_the_center_highlight(self):
+        """The disc core is contaminated by the highlight, the annulus is not."""
+        frame = self._frame_with_center_highlight()
+        config = load_config()
+        config["color_detection"]["label_classifier"]["prototype_core_inner_ratio"] = 0.0
+        disc = TopViewDetector(config, ROOT)
+        disc.detect_materials(frame, "TURNTABLE", ["1"])
+        disc_core = disc.last_materials_debug["materials"][0]["core_hsv"]
+
+        config["color_detection"]["label_classifier"]["prototype_core_inner_ratio"] = 0.5
+        annulus = TopViewDetector(config, ROOT)
+        annulus.detect_materials(frame, "TURNTABLE", ["1"])
+        annulus_core = annulus.last_materials_debug["materials"][0]["core_hsv"]
+
+        # The highlight is smaller than the skipped inner radius, so the
+        # annulus samples the material's own colour while the full disc core
+        # averages the washed-out spot into it.
+        self.assertGreater(annulus_core[1], disc_core[1] + 10.0)
+        self.assertAlmostEqual(annulus_core[1], self.MATERIAL[1], delta=6.0)
+        for core in (disc_core, annulus_core):
+            self.assertGreater(core[0], 140.0)
+            self.assertLess(core[0], 179.0)
+
+    def test_a_mostly_glare_hole_is_not_rejected_as_a_ring(self):
+        """A bright hole is a highlight; the frustum's coloured ring is not."""
+        frame = empty_scene()
+        cv2.circle(frame, (640, 360), 100, hsv_bgr(*self.MATERIAL), -1)
+        # A big blown-out spot: (65/100)^2 = 42% of the face, over the 0.3 gate.
+        cv2.circle(frame, (640, 360), 65, (255, 255, 255), -1)
+
+        config = load_config()
+        detector = TopViewDetector(config, ROOT)
+        detector.detect_materials(frame, "TURNTABLE", ["1"])
+        entries = detector.last_materials_debug["materials"]
+        self.assertEqual(len(entries), 1, "the material must survive its own glare")
+        self.assertGreater(entries[0]["hole_ratio"], 0.3)
+        self.assertGreaterEqual(entries[0]["hole_glare_ratio"], 0.6)
+        self.assertGreater(
+            detector.last_materials_debug["filter_stats"]["1"]["glare_hole_excused"],
+            0,
+        )
+
+        # Turning the excuse off must reject it again, which proves the excuse
+        # (and not some other metric) is what accepted it.
+        config["color_detection"]["geometry"]["glare_hole_ratio"] = 1.1
+        strict = TopViewDetector(config, ROOT)
+        strict.detect_materials(frame, "TURNTABLE", ["1"])
+        self.assertEqual(strict.last_materials_debug["materials"], [])
+        self.assertGreater(
+            strict.last_materials_debug["filter_stats"]["1"]["hole_rejected"], 0
+        )
+
+    def test_a_coloured_ring_hole_is_still_rejected(self):
+        """The cone face of the frustum must keep failing the hole gate."""
+        frame = empty_scene()
+        cv2.circle(frame, (640, 360), 100, hsv_bgr(*self.MATERIAL), -1)
+        # Same geometry, but the hole holds another saturated colour.
+        cv2.circle(frame, (640, 360), 65, hsv_bgr(60, 220, 200), -1)
+        detector = TopViewDetector(load_config(), ROOT)
+        detector.detect_materials(frame, "TURNTABLE", ["1"])
+        self.assertEqual(detector.last_materials_debug["materials"], [])
+        stats = detector.last_materials_debug["filter_stats"]["1"]
+        self.assertEqual(stats["glare_hole_excused"], 0)
+        self.assertGreater(stats["hole_rejected"], 0)
+
+
 class PrototypeCalibrationTests(unittest.TestCase):
     CORE = (96.0, 175.0, 160.0)
 

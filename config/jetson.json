@@ -232,6 +232,8 @@
       "center_weight": 0.05,
       "accept_distance": 1.0,
       "prototype_core_ratio": 0.6,
+      "prototype_core_inner_ratio": 0.3,
+      "core_notice": "内芯取样改成【圆环】而不是实心圆：顶面是半径 0.6R 以内的区域，而硬光源的反光斑就在正中心，实心圆内芯会被它拉白拉淡。0.3 表示跳过最内 0.3x0.6R=0.18R（反光斑一般都落在这个范围），外层仍到 0.6R 保住顶面。设 0 回到旧行为（实心圆）。实测：中心反光斑在实心圆内芯里占 22% 时饱和度从 230 掉到 212，圆环取样则是 230。",
       "prototype_notice": "判色用色块内芯（半径 x0.6）的均值，避开反光边缘。若要标定，把 tools/test_turntable_color_live.py 输出的 core_hsv 填到 colors.<id>.prototype_hsv，[H,S,V] 三个数即可。"
     },
     "material_grouping": {
@@ -256,6 +258,10 @@
       "max_hole_ratio": 0.3,
       "black_min_circularity": 0.7,
       "border_margin_px": 10,
+      "glare_v_min": 235.0,
+      "glare_s_max": 60.0,
+      "glare_hole_ratio": 0.6,
+      "glare_notice": "物料顶面中心被硬光源打出的过曝斑点会在颜色掩码上留一个洞，洞太大会被 max_hole_ratio 当成【锥面环】拒掉。区分依据：洞里的像素如果是【亮且几乎无色】(V>=glare_v_min 或 S<=glare_s_max)，那是反光，不是另一个色号 —— 当这种像素占比 >= glare_hole_ratio(0.6) 时放行，并计入 filter_stats.glare_hole_excused；真锥面环/印刷环里的像素是彩色的，照旧被拒。物料 JSON 里的 hole_glare_ratio 就是洞内高光占比。",
       "shape_notice": "物料是圆台，俯视=实心圆（φ30 顶面 + φ50 底面）。实测各指标：实心圆 mass 1.00/hole 0.00、圆带反光缺口 mass 0.80/contour_circ 0.41、不规则六边形 mass 0.83、交叉标记 mass 0.25、空心环 mass 0.25/hole 0.77、φ30-φ50 锥面环 mass 0.64/hole 0.36。结论：min_contour_circularity 分不开反光缺口与撕裂阴影（前者 0.41 反而更低），所以保持 0 = 关闭；真正有效的是 min_mass_ratio（卡碎裂/交叉标记）与 max_hole_ratio（卡锥面环、印刷环）。每块物料的 solidity/mass_ratio/contour_circularity/hole_ratio/equivalent_diameter 都会打进工具 JSON。",
       "shadow_notice": "阴影为什么过得了形状门：形状门拒的是【空心 / 碎裂 / 细长 / 不规则】的斑块（mass_ratio 0.35、hole_ratio 0.3、aspect 0.65~1.55）。单点补光灯在桌面投出的硬阴影是【实心圆盘】，实测 mass_ratio~1、hole_ratio~0、圆度~0.9，形状上和真物料一模一样，任何形状指标都分不开，所以不要再把精力放在加形状规则上。能分开它的只有三件事：① 尺度：用 tools/measure_blobs.py 量出真物料的 equivalent_diameter，按 top_areas 定 min_area/max_area，不要用全开的 max_area；② 位置：物料必须在转盘环带上，影子可以在任意处；③ 光照几何：补光加柔光罩或做成与相机同轴，硬阴影直接消失，这是根治办法。",
       "v_floor_notice": "各色 v_min 是【阴影容差】，不是颜色标定值，但【不能往噪声地板以下降】。2026-09-18 用同一帧做 A/B 实测：v_min=140 时红掩码 10.2 万 px，降到 55 后涨到 28.7 万 px（最大外轮廓包面积 41 万 px），中位【S=204 V=118】——那些是白光归一化把暗帧放大 2~3 倍后的彩色噪声，不是物料。所以 v_min 取【标称亮度的一半左右】且明显高于噪声地板，现在定 80/85/85/80/70。真阴影里的物料掉到噪声地板以下时，靠降 v_min 救不回来，正确做法是：抬曝光/gain、换 dim_30fps 或 dim_room_locked 档、改补光几何。"

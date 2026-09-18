@@ -139,11 +139,22 @@ class TopViewDetector:
             geometry.get("min_contour_circularity", 0.0)
         )
         # A blob with a bigger hole than this is rejected unless another blob
-        # fills that hole (see the frustum ring rule in _materials_in_roi).
+        # fills that hole (see the frustum ring rule in _materials_in_roi) or
+        # the hole is the specular highlight instead of a ring of another
+        # colour (see the glare check below).
         # Absent in the config means the gate is off.
         hole_limit = geometry.get("max_hole_ratio")
         self.color_max_hole_ratio = (
             1.0 if hole_limit is None else float(hole_limit)
+        )
+        # A hard light source puts a blown-out spot in the middle of the top
+        # face. It is bright and nearly achromatic, while the hole of a frustum
+        # ring contains the coloured conical face, so the pixels inside the
+        # hole tell the two apart.
+        self.color_glare_v_min = float(geometry.get("glare_v_min", 235.0))
+        self.color_glare_s_max = float(geometry.get("glare_s_max", 60.0))
+        self.color_glare_hole_ratio = float(
+            geometry.get("glare_hole_ratio", 0.6)
         )
         grouping_config = color_config.get("material_grouping", {})
         self.material_ring_hole_ratio = float(
@@ -197,6 +208,13 @@ class TopViewDetector:
         self.label_center_weight = float(label_config.get("center_weight", 0.05))
         self.prototype_core_ratio = min(
             1.0, max(0.1, float(label_config.get("prototype_core_ratio", 0.6)))
+        )
+        # Sampling the top face as an annulus instead of a full disc skips the
+        # specular spot a hard light leaves in the middle, while staying inside
+        # the φ30 face (which is the inner 0.6 of the radius). 0 = old disc.
+        self.prototype_core_inner_ratio = min(
+            0.9,
+            max(0.0, float(label_config.get("prototype_core_inner_ratio", 0.3))),
         )
         # Optional per-colour calibration point measured on the real material,
         # e.g. copied from the live tool's ``core_hsv``. When present it
@@ -357,6 +375,28 @@ class TopViewDetector:
         difference = np.abs(hue - float(reference))
         return np.minimum(difference, 180.0 - difference)
 
+    def _glare_fraction(self, hsv, hole_contour, box_x, box_y, width, height):
+        """Fraction of a hole's pixels that look like specular glare.
+
+        A hole in a material mask is either the coloured conical face of the
+        frustum (another colour range) or the blown-out spot a hard lamp leaves
+        on the top face. Only the second one is excused by the hole gate.
+        """
+        local = np.zeros((height, width), dtype=np.uint8)
+        shifted = hole_contour - np.asarray([[[box_x, box_y]]], dtype=hole_contour.dtype)
+        cv2.drawContours(local, [shifted], -1, 255, -1)
+        inside = local > 0
+        total = int(np.count_nonzero(inside))
+        if total == 0:
+            return 0.0
+        patch = hsv[box_y:box_y + height, box_x:box_x + width]
+        saturation = patch[..., 1][inside].astype(np.float32)
+        value = patch[..., 2][inside].astype(np.float32)
+        glare = (value >= self.color_glare_v_min) | (
+            saturation <= self.color_glare_s_max
+        )
+        return float(np.count_nonzero(glare)) / float(total)
+
     @staticmethod
     def _contour_mask(contour, box):
         """Fill one contour into a mask of the given box."""
@@ -419,15 +459,23 @@ class TopViewDetector:
         center_y = float(top + rows.mean())
         # Classify from the inner part of the blob: the rim carries glare,
         # background bleed and demosaic artefacts, and they pull the average
-        # colour away from what the material actually is.
+        # colour away from what the material actually is. A coaxial or hard
+        # lamp adds a blown-out spot in the *middle*, so the sample is an
+        # annulus that skips both the rim and that spot.
         core_radius = max(
             2.0,
             float(np.sqrt(count / np.pi)) * self.prototype_core_ratio,
         )
+        core_inner_radius = core_radius * self.prototype_core_inner_ratio
         offset_x = columns + left - center_x
         offset_y = rows + top - center_y
-        core = (offset_x * offset_x + offset_y * offset_y) <= core_radius * core_radius
+        distance_squared = offset_x * offset_x + offset_y * offset_y
+        core = distance_squared <= core_radius * core_radius
+        if core_inner_radius > 0.0:
+            core &= distance_squared >= core_inner_radius * core_inner_radius
         if int(np.count_nonzero(core)) < max(16, count // 10):
+            # Not enough annulus pixels (tiny or ragged blob): fall back to the
+            # whole matched area rather than sampling nothing.
             core = np.ones(count, dtype=bool)
         return {
             "mean_hsv": [
@@ -470,7 +518,7 @@ class TopViewDetector:
             mask = self._clean_mask(self._make_color_mask(hsv, color_id))
             masks[color_id] = mask
             candidates, _debug, stats = self._filter_candidates(
-                mask, color_id, scene_config, hsv.shape[:2]
+                mask, color_id, scene_config, hsv.shape[:2], hsv=hsv
             )
             filter_stats[color_id] = stats
             for candidate in candidates:
@@ -487,6 +535,7 @@ class TopViewDetector:
                         "contour_circularity": candidate["contour_circularity"],
                         "hole_area": candidate["hole_area"],
                         "hole_ratio": candidate["hole_ratio"],
+                        "hole_glare_ratio": candidate["hole_glare_ratio"],
                         "hole_center": candidate["hole_center"],
                         "equivalent_diameter": candidate["equivalent_diameter"],
                     }
@@ -592,6 +641,9 @@ class TopViewDetector:
                         float(representative["contour_circularity"]), 3
                     ),
                     "hole_ratio": round(float(representative["hole_ratio"]), 3),
+                "hole_glare_ratio": round(
+                    float(representative.get("hole_glare_ratio", 0.0)), 3
+                ),
                     "equivalent_diameter": round(
                         float(representative["equivalent_diameter"]), 1
                     ),
@@ -922,7 +974,7 @@ class TopViewDetector:
 
     def _filter_candidates(
         self, mask, color_id, scene_config, roi_shape,
-        offset_x=0, offset_y=0,
+        offset_x=0, offset_y=0, hsv=None,
     ):
         """Contour, hull and shape filters shared by every colour path.
 
@@ -956,6 +1008,7 @@ class TopViewDetector:
             "mass_rejected": 0,
             "fill_rejected": 0,
             "hole_rejected": 0,
+            "glare_hole_excused": 0,
             "border_rejected": 0,
             "accepted": 0,
             "area_limits_px": [minimum, maximum if np.isfinite(maximum) else None],
@@ -1007,6 +1060,7 @@ class TopViewDetector:
             mass_ratio = mass / area if area > 0.0 else 0.0
             hole_area = 0.0
             hole_center = None
+            hole_contour = None
             for hole in holes.get(index, ()):
                 current = float(cv2.contourArea(hole))
                 if current <= hole_area:
@@ -1015,11 +1069,18 @@ class TopViewDetector:
                 if moments["m00"] <= 0:
                     continue
                 hole_area = current
+                hole_contour = hole
                 hole_center = [
                     moments["m10"] / moments["m00"] + offset_x,
                     moments["m01"] / moments["m00"] + offset_y,
                 ]
             hole_ratio = hole_area / contour_area if contour_area > 0.0 else 0.0
+            hole_glare_ratio = 0.0
+            if hole_ratio > self.color_max_hole_ratio and hsv is not None \
+                    and hole_contour is not None:
+                hole_glare_ratio = self._glare_fraction(
+                    hsv, hole_contour, box_x, box_y, width, height
+                )
             equivalent_diameter = 2.0 * float(np.sqrt(area / np.pi))
             if not (
                 self.color_min_aspect_ratio
@@ -1041,8 +1102,14 @@ class TopViewDetector:
                 filter_stats["fill_rejected"] += 1
                 continue
             if hole_ratio > self.color_max_hole_ratio:
-                filter_stats["hole_rejected"] += 1
-                continue
+                if hole_glare_ratio >= self.color_glare_hole_ratio:
+                    # A blown-out spot, not a ring of another colour: the
+                    # highlight hides the top face, it does not change what the
+                    # material is.
+                    filter_stats["glare_hole_excused"] += 1
+                else:
+                    filter_stats["hole_rejected"] += 1
+                    continue
             margin = self.color_border_margin
             if (
                 box_x <= margin
@@ -1077,6 +1144,7 @@ class TopViewDetector:
                 "fill_ratio": fill_ratio,
                 "hole_area": hole_area,
                 "hole_ratio": hole_ratio,
+                "hole_glare_ratio": hole_glare_ratio,
                 "hole_center": hole_center,
                 "equivalent_diameter": equivalent_diameter,
                 "color_id": color_id,
