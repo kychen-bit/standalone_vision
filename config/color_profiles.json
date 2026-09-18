@@ -1,0 +1,10 @@
+{
+  "notice": "按补光模式分开的颜色参数。lighting.fill_light=true 时只用 config/jetson.json 里的 colors/color_detection（你有补光时标定的那套）；false 时把下面 ambient 节深合并覆盖上去。只写要改的键即可，不用整段复制。",
+  "how_to_use": {
+    "切换": "config/jetson.json -> lighting.fill_light，或命令行 --fill-light / --no-fill-light",
+    "只改一个色号的 V 下限": "\"ambient\": {\"colors\": {\"2\": {\"hsv_ranges\": [{\"v_min\": 120}]}}}  —— 注意 hsv_ranges 是列表，写了就会整段替换该色号的区间",
+    "更推荐的做法": "无补光下不要手改区间，直接在实时工具里鼠标指物料按 1~6 采原型（不需要动掩码），原型会写进本文件的 ambient 节"
+  },
+  "fill": {},
+  "ambient": {}
+}

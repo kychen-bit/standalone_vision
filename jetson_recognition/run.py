@@ -9,7 +9,8 @@ import time
 import cv2
 import numpy as np
 
-from .camera import UVCCamera
+from .camera import UVCCamera, apply_capture_profile
+from .color_profiles import apply_color_profile
 from .coordinator import run_coordinator
 from .detectors import TopViewDetector
 from .engine import RecognitionEngine, stable_measurement
@@ -376,6 +377,9 @@ def draw_pickup(frame, update, pickup_session):
 
 def build_engine(config):
     cv2.setUseOptimized(True)
+    # Fill-light and ambient work need different colour parameters; the active
+    # set is merged in here so every entry point sees the same numbers.
+    apply_color_profile(config, PROJECT_ROOT)
     opencv_threads = int(config.get("runtime", {}).get("opencv_threads", 0))
     if opencv_threads > 0:
         cv2.setNumThreads(opencv_threads)
@@ -904,6 +908,10 @@ def run_maix_network_receiver(arguments):
 def parser():
     root = argparse.ArgumentParser(description="Jetson recognition-only tester (serial is optional)")
     root.add_argument("--config", default="config/jetson.json")
+    root.add_argument(
+        "--capture-profile",
+        help="override camera.capture_profile, e.g. wide_4_3 to compare fields of view",
+    )
     root.add_argument("--serial", help="optional result-output serial device")
     root.add_argument("--baud", type=int, default=115200)
     # JetPack 4 on many Jetson Nano boards still uses Python 3.6, where the
@@ -1060,6 +1068,9 @@ def main():
             "choose one test source: live, image, pickup, bridge, maix-net or coordinator"
         )
     config = load_config(arguments.config)
+    # Resolve the capture mode before the detector validates its ROIs against
+    # the frame size.
+    apply_capture_profile(config["camera"], arguments.capture_profile)
     if arguments.source == "bridge":
         raise SystemExit(run_bridge(arguments))
     if arguments.source == "maix-net":

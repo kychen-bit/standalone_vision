@@ -20,8 +20,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from jetson_recognition.camera import UVCCamera
+from jetson_recognition.camera import UVCCamera, apply_capture_profile
 from jetson_recognition.color_batch import assign_distinct, assignment_margin
+from jetson_recognition.color_profiles import apply_color_profile, save_override
 from jetson_recognition.run import HSVProbe, RollingPerformance, build_engine
 from jetson_recognition.stability import SimpleColorStability
 from jetson_recognition.task_code import COLOR_NAMES, decode_task_code
@@ -41,12 +42,246 @@ def parse_colors(arguments):
     return colors
 
 
+def nearest_material(entries, position):
+    """Index of the material under the mouse, or the largest one."""
+    if not entries:
+        return None
+    if position is None:
+        return max(range(len(entries)), key=lambda index: entries[index]["area"])
+    return min(
+        range(len(entries)),
+        key=lambda index: (
+            (entries[index]["center"][0] - position[0]) ** 2
+            + (entries[index]["center"][1] - position[1]) ** 2
+        ),
+    )
+
+
+def save_prototypes(config_path, prototypes, project_root=None, profile=None):
+    """Write colors.<id>.prototype_hsv where the active mode keeps its values.
+
+    The fill-light set lives in config/jetson.json (that is what was tuned with
+    a light on); the no-fill-light set lives in config/color_profiles.json, so
+    sampling in ambient mode never overwrites the fill-light calibration.
+    """
+    payload = {
+        color_id: {
+            "prototype_hsv": [round(float(value), 1) for value in values]
+        }
+        for color_id, values in sorted(prototypes.items())
+    }
+    if profile == "ambient" and project_root is not None:
+        return "%s (backup %s)" % (
+            "config/color_profiles.json",
+            save_override(project_root, "ambient", "colors", payload),
+        )
+    from tools.capture_camera_profile import save_config
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    for color_id, block in payload.items():
+        config.setdefault("colors", {}).setdefault(color_id, {}).update(block)
+    return save_config(config_path, config)
+
+
+def channel_excess(detector, color_id, hue, saturation, value):
+    """How far a measured colour sits outside colors.<id>, per channel.
+
+    This is the actionable part of the diagnosis: it says which bound to move
+    (for example ``{"V": 45}`` means "v_min is 45 too high").
+    """
+    if color_id == "5":
+        black = detector.black_threshold or {}
+        excess = {}
+        over = value - float(black.get("v_max", 80))
+        if over > 0:
+            excess["V"] = round(over, 1)
+        low = float(black.get("s_min", 0)) - saturation
+        high = saturation - float(black.get("s_max", 255))
+        if max(low, high) > 0:
+            excess["S"] = round(max(low, high), 1)
+        return excess
+    best = None
+    for lower, upper in detector.color_ranges.get(color_id, ()):
+        excess = {}
+        for name, sample, lo, hi in (
+            ("H", hue, lower[0], upper[0]),
+            ("S", saturation, lower[1], upper[1]),
+            ("V", value, lower[2], upper[2]),
+        ):
+            over = max(float(lo) - sample, sample - float(hi))
+            if over > 0:
+                excess[name] = round(over, 1)
+        if best is None or sum(excess.values()) < sum(best.values()):
+            best = excess
+    return best or {}
+
+
+def jsonable(value):
+    """Make a nested debug structure safe for json.dumps.
+
+    The material debug entries carry numpy arrays (contours, scores), which are
+    useful in the window but cannot be serialised.
+    """
+    if isinstance(value, dict):
+        return {str(key): jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return "<ndarray %s>" % (tuple(value.shape),)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return value
+
+
+def diagnose(detector, frame, colors, color_names, output_dir):
+    """Print why each colour does or does not produce a material.
+
+    This answers "only red is detected" without guessing: it reports the mask
+    size, the median HSV *inside* the mask (compare it with colors.<id>.hsv_
+    ranges), which filter rejected the blobs, and the area band to put into
+    scenes.*.min_area/max_area. A frame and a mask montage are written next to
+    the log so the images can be shared.
+    """
+    # Threshold the frame the detector actually sees: in no-fill-light mode that
+    # is the white-balanced one, and reporting the raw frame's masks would
+    # describe pixels that never reach the colour decision.
+    work = detector._work_frame(frame)
+    hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
+    report = {"state": "DIAGNOSE", "frame_px": [int(work.shape[1]), int(work.shape[0])]}
+    report["thresholded_frame"] = "white_balanced" if work is not frame else "raw"
+    report["illumination"] = detector.last_illumination
+    report["lighting"] = {
+        "fill_light": detector.fill_light,
+        "illumination_enabled": detector.illumination_enabled,
+    }
+    tiles = []
+    colours_report = {}
+    for color_id in colors:
+        mask = detector._clean_mask(detector._make_color_mask(hsv, color_id))
+        count = int(np.count_nonzero(mask))
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        areas = sorted(
+            (float(cv2.contourArea(contour)) for contour in contours), reverse=True
+        )[:3]
+        entry = {"mask_px": count, "top_areas": [int(value) for value in areas]}
+        if count:
+            # Boolean masking: a uint8 0/255 array would index instead of mask.
+            inside = mask > 0
+            entry["mask_hsv_median"] = [
+                int(np.median(hsv[..., 0][inside])),
+                int(np.median(hsv[..., 1][inside])),
+                int(np.median(hsv[..., 2][inside])),
+            ]
+            entry["mask_v_percentiles"] = [
+                int(value)
+                for value in np.percentile(hsv[..., 2][inside], [10, 50, 90])
+            ]
+            entry["mask_hue_percentiles"] = [
+                int(value)
+                for value in np.percentile(hsv[..., 0][inside], [10, 50, 90])
+            ]
+        colours_report[color_id] = entry
+        tiles.append(
+            cv2.cvtColor(
+                cv2.resize(mask, (426, 240), interpolation=cv2.INTER_AREA),
+                cv2.COLOR_GRAY2BGR,
+            )
+        )
+    report["colors"] = colours_report
+    debug = detector.last_materials_debug or {}
+    materials = list(debug.get("materials", []))
+    for entry in materials:
+        core = entry.get("core_hsv")
+        if not core:
+            continue
+        entry["outside_ranges"] = {
+            color_id: excess
+            for color_id, excess in (
+                (color_id, channel_excess(detector, color_id, core[0], core[1], core[2]))
+                for color_id in colors
+            )
+            if excess
+        }
+    report["materials"] = materials
+    report["rings_explained"] = debug.get("rings_explained", [])
+    report["filter_stats"] = debug.get("filter_stats", {})
+    report["expected_shape"] = {
+        "notice": "物料是圆台：俯视=填充圆，φ30 顶面在内、φ50 底面在外",
+        "mass_ratio_min": detector.color_min_mass_ratio,
+        "hole_ratio_max": detector.color_max_hole_ratio,
+        "contour_circularity_min": detector.color_min_contour_circularity,
+    }
+    diameters = [
+        float(entry["equivalent_diameter"]) for entry in report["materials"]
+    ]
+    if diameters:
+        radius = max(diameters) / 2.0
+        area = float(np.pi) * radius * radius
+        report["recommended_area"] = {
+            "min_area": int(area * 0.35),
+            "max_area": int(area * 2.5),
+            "note": "把这两个数写进 scenes.<当前场景>.min_area/max_area",
+        }
+    print(json.dumps(jsonable(report), ensure_ascii=False), flush=True)
+
+    if output_dir is not None:
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            frame_path = output_dir / ("diag_%s_frame.png" % stamp)
+            cv2.imwrite(str(frame_path), frame)
+            rows = []
+            for index in range(0, len(tiles), 3):
+                row = list(tiles[index:index + 3])
+                while len(row) < 3:
+                    row.append(np.zeros_like(tiles[0]))
+                rows.append(np.hstack(row))
+            montage = np.vstack(rows)
+            mask_path = output_dir / ("diag_%s_masks.png" % stamp)
+            cv2.imwrite(str(mask_path), montage)
+            print(
+                json.dumps(
+                    {"state": "DIAGNOSE_SAVED", "frame": str(frame_path),
+                     "masks": str(mask_path),
+                     "layout": "1-6 masks, then the frame"},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+        except OSError as error:
+            print(
+                json.dumps({"state": "DIAGNOSE_SAVE_FAILED", "error": str(error)}),
+                flush=True,
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="recognise all colors in one round and report target dx/dy"
     )
     parser.add_argument("--config", default="config/jetson.json")
     parser.add_argument("--camera")
+    parser.add_argument(
+        "--dump-every",
+        type=int,
+        default=0,
+        help="print the full colour diagnosis every N frames (0 = only on the d key)",
+    )
+    parser.add_argument(
+        "--dump-dir",
+        default="logs",
+        help="where the diagnosis frame and mask montage are written",
+    )
+    parser.add_argument(
+        "--capture-profile",
+        help="override camera.capture_profile, e.g. wide_4_3 to compare fields of view",
+    )
     parser.add_argument(
         "--camera-backend",
         choices=("opencv_v4l2", "gstreamer_nv"),
@@ -58,8 +293,16 @@ def main():
     source.add_argument("--round-colors", nargs=3, choices=tuple("123456"))
     source.add_argument("--all-colors", action="store_true")
     parser.add_argument("--batch", type=int, choices=(1, 2), default=1)
-    parser.add_argument("--reference-x", type=float, default=640.0)
-    parser.add_argument("--reference-y", type=float, default=360.0)
+    parser.add_argument(
+        "--reference-x",
+        type=float,
+        help="defaults to half the configured frame width",
+    )
+    parser.add_argument(
+        "--reference-y",
+        type=float,
+        help="defaults to half the configured frame height",
+    )
     parser.add_argument("--print-every", type=int, default=15)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
@@ -78,12 +321,35 @@ def main():
         default=8,
         help="frames that must agree on the same round batch",
     )
+    lighting = parser.add_mutually_exclusive_group()
+    lighting.add_argument(
+        "--fill-light",
+        dest="fill_light",
+        action="store_true",
+        help="downward fill light present: disable the per-frame white balance",
+    )
+    lighting.add_argument(
+        "--no-fill-light",
+        dest="fill_light",
+        action="store_false",
+        help="no fill light (competition rule): enable the white balance",
+    )
+    parser.set_defaults(fill_light=None)
     arguments = parser.parse_args()
 
     config_path = Path(arguments.config)
     if not config_path.is_absolute():
         config_path = PROJECT_ROOT / config_path
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    if arguments.fill_light is not None:
+        config.setdefault("lighting", {})["fill_light"] = bool(arguments.fill_light)
+    # Follow the configured frame size instead of a hard-coded 1280x720 centre,
+    # so a capture-mode change does not silently move the reference point.
+    apply_capture_profile(config["camera"], arguments.capture_profile)
+    if arguments.reference_x is None:
+        arguments.reference_x = float(config["camera"]["width"]) / 2.0
+    if arguments.reference_y is None:
+        arguments.reference_y = float(config["camera"]["height"]) / 2.0
     colors = parse_colors(arguments)
     if arguments.target not in colors:
         raise SystemExit("--target must be one of this round's colors")
@@ -91,12 +357,30 @@ def main():
     engine = build_engine(config)
     detector = engine.detector
     detector.set_color_debug(True)
+    profile_info = apply_color_profile(config, PROJECT_ROOT, quiet=True)
+    active_profile = profile_info.get("profile")
     if arguments.no_illumination:
         detector.illumination.enabled = False
         detector.illumination_enabled = False
         print('{"state":"ILLUMINATION_DISABLED","reason":"A/B comparison"}', flush=True)
+    print(
+        json.dumps(
+            {
+                "state": "LIGHTING_MODE",
+                "fill_light": detector.fill_light,
+                "illumination_enabled": detector.illumination_enabled,
+                "color_profile": active_profile,
+                "prototypes_configured": sorted(detector.color_prototypes),
+                "hint": "press 1..6 to lock the material under the mouse as that colour's prototype, w to save",
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     batch_mode = not arguments.no_batch
     vote_frames = max(1, int(arguments.vote_frames))
+    dump_every = max(0, int(arguments.dump_every))
+    dump_dir = PROJECT_ROOT / arguments.dump_dir
     batch_history = deque(maxlen=vote_frames)
     hsv_probe = HSVProbe()
     window_name = "Turntable all-color target test"
@@ -200,6 +484,11 @@ def main():
             else:
                 measurements = detector.detect_colors(frame, "TURNTABLE", colors)
                 entries = []
+            # The detector works on the white-balanced frame; every readout and
+            # every saved diagnosis image uses the same frame.
+            base = detector.last_balanced_frame
+            if base is None:
+                base = frame
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             performance.update(elapsed_ms)
             if frame_number % 60 == 0:
@@ -289,6 +578,12 @@ def main():
                             "distance": round(entry["distance"], 3),
                             "margin": round(entry["margin"], 3),
                             "area": round(entry["area"], 1),
+                            "core_hsv": entry["core_hsv"],
+                            "mean_hsv": entry["mean_hsv"],
+                            "solidity": entry["solidity"],
+                            "mass_ratio": entry["mass_ratio"],
+                            "fill_ratio": entry["fill_ratio"],
+                            "circularity": entry["circularity"],
                         }
                         for index, entry in enumerate(entries)
                     ]
@@ -305,12 +600,15 @@ def main():
                 last_report_time = now
             last_signature = signature
 
+            if dump_every and frame_number % dump_every == 0:
+                diagnose(
+                    detector, base, colors, COLOR_NAMES,
+                    PROJECT_ROOT / arguments.dump_dir,
+                )
+
             if not arguments.headless:
                 # Show the white-balanced frame: it is what the detector sees,
                 # and the probe then reports the values the thresholds use.
-                base = detector.last_balanced_frame
-                if base is None:
-                    base = frame
                 canvas = base.copy()
                 reference = (int(arguments.reference_x), int(arguments.reference_y))
                 cv2.drawMarker(canvas, reference, (255, 0, 255), cv2.MARKER_CROSS, 28, 2)
@@ -384,10 +682,23 @@ def main():
                         controls.get("focus_automatic_continuous", "?"),
                         controls.get("white_balance_automatic", "?"),
                     ),
-                    "LIGHT %s ref=%s gain=%s" % (
+                    "LIGHT %s ref=%s gain=%s n=%.3f %s" % (
                         light.get("reason", "OFF"),
                         light.get("white_ref_bgr"),
                         light.get("gain"),
+                        float(light.get("neutral_ratio", 0.0)),
+                        light.get("exposure_hint", ""),
+                    ),
+                    "PROTO %s  [1-6] lock under mouse, [w] save json" % (
+                        ",".join(
+                            "%s:%s" % (
+                                color_id,
+                                ",".join("%.0f" % value for value in values),
+                            )
+                            for color_id, values in sorted(
+                                detector.color_prototypes.items()
+                            )
+                        ) or "none",
                     ),
                 ]
                 for index, text in enumerate(info_lines):
@@ -396,8 +707,74 @@ def main():
                                 0.58, (0, 255, 0), 2, cv2.LINE_AA)
                 canvas = hsv_probe.draw(base, canvas)
                 cv2.imshow(window_name, canvas)
-                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
                     break
+                if key == ord("d"):
+                    diagnose(
+                        detector, base, colors, COLOR_NAMES,
+                        PROJECT_ROOT / arguments.dump_dir,
+                    )
+                if key == ord("w"):
+                    try:
+                        backup = save_prototypes(
+                            config_path, detector.color_prototypes,
+                            PROJECT_ROOT, active_profile,
+                        )
+                        print(
+                            json.dumps(
+                                {
+                                    "state": "PROTOTYPES_SAVED",
+                                    "prototypes": detector.color_prototypes,
+                                    "backup": backup,
+                                    "config": str(config_path),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+                    except (OSError, ValueError, KeyError) as error:
+                        print(
+                            json.dumps(
+                                {"state": "PROTOTYPES_SAVE_FAILED",
+                                 "error": str(error)},
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+                elif 32 <= key < 127 and chr(key) in "123456":
+                    color_id = chr(key)
+                    index = nearest_material(entries, hsv_probe.position)
+                    if index is None:
+                        print(
+                            json.dumps(
+                                {"state": "PROTOTYPE_SKIPPED",
+                                 "reason": "NO_MATERIAL_VISIBLE"},
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+                    else:
+                        values = [float(value) for value in entries[index]["core_hsv"]]
+                        detector.color_prototypes[color_id] = values
+                        print(
+                            json.dumps(
+                                {
+                                    "state": "PROTOTYPE_LOCKED",
+                                    "color": color_id,
+                                    "color_name": COLOR_NAMES[color_id],
+                                    "core_hsv": [round(value, 1) for value in values],
+                                    "blob_id": entries[index]["color_id"],
+                                    "center_px": [
+                                        round(value, 1)
+                                        for value in entries[index]["center"]
+                                    ],
+                                    "press": "w to save",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
     except KeyboardInterrupt:
         pass
     finally:
