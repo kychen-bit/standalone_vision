@@ -238,13 +238,34 @@ class DetectorTests(unittest.TestCase):
             [0, 0, 1280, 720],
         )
 
-    def test_black_uses_value_not_hue(self):
+    def test_dark_achromatic_patch_is_black_for_any_hue(self):
+        """Hue stays irrelevant for black; chroma is what changed.
+
+        The patch is dark and nearly grey, i.e. a real black material with only
+        the tiny hue offset a demosaic leaves behind.
+        """
+        detector = TopViewDetector(load_config(), ROOT)
+        for hue in (0, 60, 120):
+            frame = np.full((720, 1280, 3), 255, dtype=np.uint8)
+            cv2.rectangle(frame, (500, 300), (600, 400), hsv_bgr(hue, 20, 40), -1)
+            with self.subTest(hue=hue):
+                self.assertIsNotNone(detector.detect_color(frame, "black", "PAPER_TEST"))
+
+    def test_dark_saturated_patch_is_not_black(self):
+        """Regression: a shadowed colour is dark but still very saturated.
+
+        Measured on the rig: the arm's end effector left the red material at
+        V<=80 while S stayed 255. With black's old s_max=255 the largest black
+        blob *was* that shadowed red material (128 084 px, median H=0 S=255
+        V=18), which is why red and light blue "were all recognised as black".
+        Black therefore requires low chroma as well as low value.
+        """
         detector = TopViewDetector(load_config(), ROOT)
         for hue in (0, 60, 120):
             frame = np.full((720, 1280, 3), 255, dtype=np.uint8)
             cv2.rectangle(frame, (500, 300), (600, 400), hsv_bgr(hue, 220, 40), -1)
             with self.subTest(hue=hue):
-                self.assertIsNotNone(detector.detect_color(frame, "black", "PAPER_TEST"))
+                self.assertIsNone(detector.detect_color(frame, "black", "PAPER_TEST"))
 
     def test_black_rejects_irregular_shadow(self):
         detector = TopViewDetector(load_config(), ROOT)

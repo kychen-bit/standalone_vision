@@ -13,17 +13,76 @@ import cv2
 import numpy as np
 
 
+def apply_capture_profile(camera_config, override=None):
+    """Resolve ``camera.capture_profiles`` into width/height/fps.
+
+    Switching the capture mode is the reliable way to change the field of view
+    on this camera: the modes are enumerated by the device itself. Measured on
+    the DECXIN module, 1280x720 is a 16:9 vertical crop of the 4:3 sensor, so
+    1280x960 keeps the horizontal field and adds 33% vertically at the same
+    pixel density. The ``zoom_absolute`` control can only ever make the field
+    narrower and answers EIO before the first frame, so it is not a substitute.
+
+    Idempotent: the values come from the profile, not from the current size.
+    """
+    profiles = camera_config.get("capture_profiles") or {}
+    name = override or camera_config.get("capture_profile")
+    width = int(camera_config.get("width", 1280))
+    height = int(camera_config.get("height", 720))
+    fps = float(camera_config.get("fps", 30))
+    if name:
+        if name not in profiles:
+            raise ValueError(
+                "unknown camera.capture_profile: %s (available: %s)"
+                % (name, ", ".join(sorted(profiles)) or "none")
+            )
+        profile = dict(profiles[name])
+        if profile.get("width"):
+            width = int(profile["width"])
+        if profile.get("height"):
+            height = int(profile["height"])
+        if profile.get("fps"):
+            fps = float(profile["fps"])
+    camera_config["width"] = width
+    camera_config["height"] = height
+    camera_config["fps"] = fps
+    reference = str(camera_config.get("roi_reference_frame") or "")
+    summary = {
+        "state": "CAPTURE_MODE",
+        "profile": name,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "roi_reference_frame": reference or None,
+        "roi_needs_redraw": bool(
+            reference and reference != "%dx%d" % (width, height)
+        ),
+    }
+    if summary["roi_needs_redraw"]:
+        summary["warning"] = (
+            "scenes.* ROI were drawn for %s; redraw them with tools/pick_roi.py "
+            "before trusting the boxes" % reference
+        )
+    if name:
+        print(json.dumps(summary, ensure_ascii=False), flush=True)
+    return summary
+
+
 class UVCCamera:
     def __init__(self, config, project_root, device_override=None):
+        # Resolve the capture profile first so everything downstream only ever
+        # sees one frame size.
+        self.capture_mode = apply_capture_profile(config)
         self.config = dict(config)
         source = config.get("device", 0) if device_override is None else device_override
         if isinstance(source, str) and source.isdigit():
             source = int(source)
         self.source = source
         self.lock_handle = None
+        self.control_failures = {}
         self._lock_device(config, source)
         try:
-            self._apply_v4l2_controls(config, source)
+            self.control_failures = self._apply_v4l2_controls(config, source)
         except Exception:
             self._release_device_lock()
             raise
@@ -74,6 +133,42 @@ class UVCCamera:
         self.actual_settings = self._read_actual_settings()
         self.startup_controls = self._read_current_controls(source)
         self._check_actual_settings(config, fourcc)
+        # Retry the controls that failed before the device had a stream, then
+        # decide: a control listed in camera.v4l2_controls_optional only warns,
+        # everything else still refuses to start in strict mode.
+        if self.control_failures:
+            self.control_failures = self._apply_v4l2_controls(
+                config, source, names=list(self.control_failures)
+            )
+        if self.control_failures:
+            optional = set(
+                config.get("v4l2_controls_optional", ("zoom_absolute",))
+            )
+            hard = {
+                name: error
+                for name, error in sorted(self.control_failures.items())
+                if name not in optional
+            }
+            print(
+                json.dumps(
+                    {
+                        "state": "CAMERA_CONTROL_WARNING",
+                        "failed": self.control_failures,
+                        "optional": sorted(optional),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            if hard and bool(config.get("v4l2_controls_strict", True)):
+                self.capture.release()
+                self._release_device_lock()
+                raise RuntimeError(
+                    "failed to set "
+                    + ", ".join(
+                        "%s (%s)" % (name, error) for name, error in hard.items()
+                    )
+                )
         self.map_x = None
         self.map_y = None
 
@@ -84,11 +179,18 @@ class UVCCamera:
             calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
             requested_size = [int(config["width"]), int(config["height"])]
             calibrated_size = calibration.get("image_size")
-            if calibrated_size and list(calibrated_size) != requested_size:
-                raise RuntimeError("calibration resolution does not match camera config")
+            size_mismatch = bool(
+                calibrated_size and list(calibrated_size) != requested_size
+            )
             matrix = calibration.get("camera_matrix")
             distortion = calibration.get("dist_coeffs")
             if matrix and distortion:
+                # The undistortion maps are built for one resolution: refuse to
+                # silently apply them to another one.
+                if size_mismatch:
+                    raise RuntimeError(
+                        "calibration resolution does not match camera config"
+                    )
                 camera_matrix = np.asarray(matrix, dtype=np.float64)
                 dist_coeffs = np.asarray(distortion, dtype=np.float64)
                 self.map_x, self.map_y = cv2.initUndistortRectifyMap(
@@ -98,6 +200,26 @@ class UVCCamera:
                     camera_matrix,
                     tuple(requested_size),
                     cv2.CV_32FC1,
+                )
+            elif size_mismatch and any(
+                plane.get("calibrated") for plane in calibration.get("planes", {}).values()
+            ):
+                # Nothing to undistort, but a plane homography was measured for
+                # the other resolution, so the PX/MM mapping is now wrong.
+                print(
+                    json.dumps(
+                        {
+                            "state": "CALIBRATION_SIZE_MISMATCH",
+                            "calibration_image_size": calibrated_size,
+                            "active_frame": requested_size,
+                            "message": (
+                                "plane calibration was measured for another "
+                                "capture mode; output in MM will be wrong"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
                 )
 
         # V4L2 may retain more than one decoded frame even when buffer size is
@@ -264,7 +386,36 @@ class UVCCamera:
             return source
         return None
 
-    def _apply_v4l2_controls(self, config, source):
+    @staticmethod
+    def _set_control(device, name, value):
+        """Return None on success, else the v4l2-ctl error text."""
+        command = [
+            "v4l2-ctl",
+            "-d",
+            device,
+            "--set-ctrl=%s=%s" % (name, value),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+            )
+        except OSError as error:
+            return "cannot execute v4l2-ctl: %s" % error
+        if completed.returncode != 0:
+            return (completed.stderr or completed.stdout).strip().replace("\n", " ")
+        return None
+
+    def _apply_v4l2_controls(self, config, source, names=None):
+        """Apply the configured controls; return {name: error} for failures.
+
+        Every control is attempted: one unhappy control must not stop the
+        others, and the caller decides whether a failure is fatal. The zoom
+        extension unit on this DECXIN camera answers EIO until the device has
+        produced a frame, which is why the caller retries after opening.
+        """
         profile_name = config.get("v4l2_control_profile")
         profiles = config.get("v4l2_control_profiles", {})
         controls = dict(config.get("v4l2_controls", {}))
@@ -274,25 +425,33 @@ class UVCCamera:
                     "unknown camera.v4l2_control_profile: %s" % profile_name
                 )
             profile = dict(profiles[profile_name])
+            # Read the replace flag before stripping documentation keys, or a
+            # profile that means "ignore the base block" would silently inherit
+            # it instead.
+            replace_base = bool(profile.get("_replace_base", False))
+            # A profile may document itself; those keys are not controls and
+            # sending them to v4l2-ctl would abort startup in strict mode.
+            for name in list(profile):
+                if name == "notice" or name.startswith("_") or name.endswith("_notice"):
+                    profile.pop(name)
             # Automatic profiles should be able to reproduce a normal direct
             # camera open without inheriting unrelated manual tuning (for
             # example a stale absolute focus or extreme sharpness value).
-            if profile.pop("_replace_base", False):
+            if replace_base:
                 controls = {}
             controls.update(profile)
         if not controls:
-            return
-        strict = bool(config.get("v4l2_controls_strict", True))
+            return {}
         device = self._v4l2_device(source)
         if platform.system() != "Linux" or device is None:
             message = "V4L2 controls require a Linux /dev/video* device"
-            if strict:
+            if bool(config.get("v4l2_controls_strict", True)):
                 raise RuntimeError(message)
             print(
                 json.dumps({"state": "CAMERA_CONTROL_WARNING", "message": message}),
                 flush=True,
             )
-            return
+            return {}
 
         # Disable automatic algorithms before setting their dependent manual
         # values. Do not rely on JSON object ordering for this safety rule.
@@ -305,45 +464,17 @@ class UVCCamera:
         ordered_names.extend(
             name for name in controls if name not in automatic_controls
         )
+        failures = {}
         for name in ordered_names:
-            value = controls[name]
+            if names is not None and name not in names:
+                continue
+            value = controls.get(name)
             if value is None:
                 continue
-            command = [
-                "v4l2-ctl",
-                "-d",
-                device,
-                "--set-ctrl=%s=%s" % (name, value),
-            ]
-            try:
-                completed = subprocess.run(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True,
-                )
-            except OSError as error:
-                message = "cannot execute v4l2-ctl: %s" % error
-                if strict:
-                    raise RuntimeError(message)
-                print(
-                    json.dumps(
-                        {"state": "CAMERA_CONTROL_WARNING", "message": message}
-                    ),
-                    flush=True,
-                )
-                return
-            if completed.returncode != 0:
-                detail = (completed.stderr or completed.stdout).strip()
-                message = "failed to set %s=%s: %s" % (name, value, detail)
-                if strict:
-                    raise RuntimeError(message)
-                print(
-                    json.dumps(
-                        {"state": "CAMERA_CONTROL_WARNING", "message": message}
-                    ),
-                    flush=True,
-                )
+            error = self._set_control(device, name, value)
+            if error:
+                failures[name] = error
+        return failures
 
     @staticmethod
     def _fourcc_text(value):
