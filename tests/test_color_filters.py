@@ -186,34 +186,6 @@ class GlareTests(unittest.TestCase):
         self.assertEqual(stats["glare_hole_excused"], 0)
         self.assertGreater(stats["hole_rejected"], 0)
 
-    def test_black_survives_a_tinted_highlight(self):
-        """A black part's highlight is often tinted, not blown out.
-
-        Measured shape of the failure: the black material sits at V~25, the
-        lamp's reflection on its top face is V~200 with S~100 - neither blown
-        out (V<235) nor achromatic (S>60). Judged against the material's own
-        brightness it is still glaringly bright, so the hole must be excused
-        rather than read as the frustum's coloured ring.
-        """
-        frame = np.full((720, 1280, 3), 200, dtype=np.uint8)
-        cv2.circle(frame, (640, 360), 100, (18, 18, 18), -1)          # black part
-        cv2.circle(frame, (640, 360), 62, hsv_bgr(0, 100, 200), -1)   # tinted glare
-        config = load_config()
-        config["lights"] = config.get("lights")
-        detector = TopViewDetector(config, ROOT)
-        detector.detect_materials(frame, "TURNTABLE", ["5"])
-        entries = detector.last_materials_debug["materials"]
-        self.assertEqual(len(entries), 1, "black must survive its own highlight")
-        self.assertGreaterEqual(entries[0]["hole_glare_ratio"], 0.6)
-
-        # A dark ring of another colour inside black is NOT glare and stays out.
-        frame = np.full((720, 1280, 3), 200, dtype=np.uint8)
-        cv2.circle(frame, (640, 360), 100, (18, 18, 18), -1)
-        cv2.circle(frame, (640, 360), 62, hsv_bgr(60, 200, 40), -1)
-        strict = TopViewDetector(load_config(), ROOT)
-        strict.detect_materials(frame, "TURNTABLE", ["5"])
-        self.assertEqual(strict.last_materials_debug["materials"], [])
-
 
 class PrototypeCalibrationTests(unittest.TestCase):
     CORE = (96.0, 175.0, 160.0)

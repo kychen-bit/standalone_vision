@@ -156,16 +156,6 @@ class TopViewDetector:
         self.color_glare_hole_ratio = float(
             geometry.get("glare_hole_ratio", 0.6)
         )
-        # A black material's highlight is not necessarily blown out: it can be
-        # a tinted reflection of the lamp (V ~200, S ~100), which neither the
-        # bright nor the achromatic test catches. Compared with the material's
-        # own brightness it is still far brighter, so that test is added too.
-        self.color_glare_relative_ratio = float(
-            geometry.get("glare_relative_ratio", 2.5)
-        )
-        self.color_glare_relative_floor = float(
-            geometry.get("glare_relative_floor", 120.0)
-        )
         grouping_config = color_config.get("material_grouping", {})
         self.material_ring_hole_ratio = float(
             grouping_config.get("ring_hole_ratio", 0.25)
@@ -385,16 +375,12 @@ class TopViewDetector:
         difference = np.abs(hue - float(reference))
         return np.minimum(difference, 180.0 - difference)
 
-    def _glare_fraction(self, hsv, hole_contour, box_x, box_y, width, height,
-                        material_level=0.0):
+    def _glare_fraction(self, hsv, hole_contour, box_x, box_y, width, height):
         """Fraction of a hole's pixels that look like specular glare.
 
         A hole in a material mask is either the coloured conical face of the
         frustum (another colour range) or the blown-out spot a hard lamp leaves
-        on the top face. Only the second one is excused by the hole gate, so
-        three tests are applied: blown out, achromatic, or far brighter than
-        the material itself (which is how a tinted highlight on a black part is
-        recognised).
+        on the top face. Only the second one is excused by the hole gate.
         """
         local = np.zeros((height, width), dtype=np.uint8)
         shifted = hole_contour - np.asarray([[[box_x, box_y]]], dtype=hole_contour.dtype)
@@ -409,12 +395,6 @@ class TopViewDetector:
         glare = (value >= self.color_glare_v_min) | (
             saturation <= self.color_glare_s_max
         )
-        if material_level > 0.0:
-            relative = max(
-                self.color_glare_relative_floor,
-                self.color_glare_relative_ratio * material_level,
-            )
-            glare = glare | (value >= relative)
         return float(np.count_nonzero(glare)) / float(total)
 
     @staticmethod
@@ -1078,15 +1058,6 @@ class TopViewDetector:
             patch = mask[box_y:box_y + height, box_x:box_x + width]
             mass = float(np.count_nonzero(cv2.bitwise_and(patch, local)))
             mass_ratio = mass / area if area > 0.0 else 0.0
-            if hsv is None:
-                material_level = 0.0
-            else:
-                level_pixels = hsv[box_y:box_y + height, box_x:box_x + width, 2][
-                    local > 0
-                ]
-                material_level = (
-                    float(np.median(level_pixels)) if level_pixels.size else 0.0
-                )
             hole_area = 0.0
             hole_center = None
             hole_contour = None
@@ -1108,7 +1079,7 @@ class TopViewDetector:
             if hole_ratio > self.color_max_hole_ratio and hsv is not None \
                     and hole_contour is not None:
                 hole_glare_ratio = self._glare_fraction(
-                    hsv, hole_contour, box_x, box_y, width, height, material_level
+                    hsv, hole_contour, box_x, box_y, width, height
                 )
             equivalent_diameter = 2.0 * float(np.sqrt(area / np.pi))
             if not (
