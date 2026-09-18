@@ -7,3 +7,5 @@ mask_*.png
 core
 core.*
 *.zip
+logs/*.png
+logs/diag*/
