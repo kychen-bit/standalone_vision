@@ -113,6 +113,32 @@ python3 tools/benchmark_detector.py --camera /dev/video0 \
 
 把 `--target` 依次改成 1～6，六种颜色必须分别测试。
 
+### 一轮批次入口（推荐）
+
+现场调色优先用批次工具，它一次给出这一轮三块物料各自是什么颜色：
+
+```bash
+python3 tools/test_turntable_color_live.py \
+  --task-code 234+123+432+231 --batch 1 --target 3
+```
+
+输出中的 `round_batch` 是本轮判定结果，`batch_agreement` / `batch_stable` 是一致性，
+`materials[]` 给出每块的 `core_hsv`、`distance`、`mass_ratio`、`solidity` 等实测值，
+`illumination` 给出白场与增益诊断。
+
+常用开关与快捷键：
+
+| 项目 | 作用 |
+|---|---|
+| `--fill-light` / `--no-fill-light` | 覆盖 `lighting.fill_light`，切换有/无补光方案 |
+| `--no-batch` | 退回逐色号独立掩码的旧路径（A/B 用） |
+| `--no-illumination` | 关闭白场归一化（A/B 用） |
+| 鼠标 + 按 `1`~`6` | 把鼠标下那块物料记成该色号的原型（颜色标定） |
+| 按 `w` | 把已标定的原型写回 `config/jetson.json`（会备份） |
+
+判色不准时先看 `illumination.exposure_hint`：`RAISE_EXPOSURE` 表示这张图本来就欠曝，
+要加曝光而不是调阈值。详见 [环境光鲁棒色块识别](docs/环境光鲁棒色块识别.md)。
+
 ### 调参
 
 按以下顺序一次只改一类参数：
