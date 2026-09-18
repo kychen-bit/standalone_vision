@@ -251,21 +251,21 @@ class DetectorTests(unittest.TestCase):
             with self.subTest(hue=hue):
                 self.assertIsNotNone(detector.detect_color(frame, "black", "PAPER_TEST"))
 
-    def test_dark_saturated_patch_is_not_black(self):
-        """Regression: a shadowed colour is dark but still very saturated.
+    def test_dark_saturated_patch_is_black_too(self):
+        """Measured reversal: black's gate must not require low chroma.
 
-        Measured on the rig: the arm's end effector left the red material at
-        V<=80 while S stayed 255. With black's old s_max=255 the largest black
-        blob *was* that shadowed red material (128 084 px, median H=0 S=255
-        V=18), which is why red and light blue "were all recognised as black".
-        Black therefore requires low chroma as well as low value.
+        A glossy black part reflects saturated light: the real part measured
+        H=123, S median 112, S p95 255 while a chroma gate of 90 covered only
+        0.4% of its face. So a dark saturated patch counts as black, and what
+        keeps *colours* out of the black mask is their brightness (v_min), not
+        black's saturation limit.
         """
         detector = TopViewDetector(load_config(), ROOT)
         for hue in (0, 60, 120):
             frame = np.full((720, 1280, 3), 255, dtype=np.uint8)
             cv2.rectangle(frame, (500, 300), (600, 400), hsv_bgr(hue, 220, 40), -1)
             with self.subTest(hue=hue):
-                self.assertIsNone(detector.detect_color(frame, "black", "PAPER_TEST"))
+                self.assertIsNotNone(detector.detect_color(frame, "black", "PAPER_TEST"))
 
     def test_black_rejects_irregular_shadow(self):
         detector = TopViewDetector(load_config(), ROOT)

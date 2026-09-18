@@ -1,10 +1,14 @@
-"""Colour thresholds must separate black (achromatic) from shadowed colours.
+"""Colour thresholds on the real materials.
 
-The live failure this file pins down: black's threshold had ``s_max: 255``, i.e.
-no chroma gate at all, so every pixel with V <= 80 counted as black. When the
-arm shadowed the red material its V fell below 80 while its saturation stayed at
-255, so the shadowed red material *became* the black mask - measured on a real
-frame, the largest black blob was 128 084 px with a median of H=0 S=255 V=18.
+Two measured facts drive everything here (2026-09-18, fill light, real parts):
+
+* The red part's core is fully saturated (S=255) while the warm table
+  background sits at S~101, so red needs ``s_min`` above the background.
+* The black part is *not* achromatic: its matte-textured top face reflects
+  saturated light (measured H=123, S median 112, S p95 255), and brightness and
+  chroma are anti-correlated across the face (V<40 grooves: S~220; V>210
+  highlights: S~60). Requiring low chroma for black caps it at 0.4% of the
+  face, so black must be defined by darkness alone.
 """
 
 import json
@@ -37,62 +41,53 @@ def mask_for(detector, color_id, hsv_triple):
     return detector._make_color_mask(hsv, color_id)
 
 
-class BlackIsAchromaticTest(unittest.TestCase):
+class BlackIsDarkNotAchromaticTest(unittest.TestCase):
     def setUp(self):
         self.config = load_config()
         self.detector = detector_for(self.config)
 
-    def test_black_threshold_has_a_chroma_gate(self):
+    def test_black_gate_only_limits_brightness(self):
         black = self.config["colors"]["5"]["black_threshold"]
-        self.assertLessEqual(black["s_max"], 120)
-        self.assertLess(black["v_max"], 120)
-
-    def test_shadowed_red_is_not_black(self):
-        """The regression: dark but saturated red must stay red."""
-        shadowed_red = (5, 255, 90)
-        self.assertNotEqual(
-            int(mask_for(self.detector, "5", shadowed_red)[0, 0]), 255,
-            "a saturated dark red pixel must not fall into the black mask",
-        )
-        self.assertEqual(
-            int(mask_for(self.detector, "1", shadowed_red)[0, 0]), 255,
-            "a saturated dark red pixel must still fall into the red mask",
+        self.assertLessEqual(black["v_max"], 120)
+        # Deliberate: a glossy black part reflects saturated light.
+        self.assertGreaterEqual(
+            black["s_max"], 200,
+            "a chroma gate on black cannot cover a glossy black part; measured "
+            "coverage drops from 47.9% to 0.4% of the face",
         )
 
-    def test_below_the_noise_floor_is_deliberately_undecided(self):
-        """Documented limitation: at 10x under nominal exposure, nothing wins.
-
-        Refusing to guess beats poisoning the round assignment with a wrong
-        colour; the cure for this state is exposure or light, not a threshold.
-        """
-        unusable = (5, 255, 40)
-        for color_id in ("1", "5"):
-            self.assertEqual(int(mask_for(self.detector, color_id, unusable)[0, 0]), 0)
+    def test_dark_saturated_black_face_is_in_the_black_mask(self):
+        """The measured black part: dark groove with S=220."""
+        groove = (123, 220, 30)
+        self.assertEqual(int(mask_for(self.detector, "5", groove)[0, 0]), 255)
+        # ...and it is not claimed by the blue range it is hue-close to,
+        # because blue requires S>=210 *and* V>=85.
+        self.assertEqual(int(mask_for(self.detector, "3", groove)[0, 0]), 0)
 
     def test_real_black_is_black_and_not_red(self):
         pitch_black = (0, 0, 10)
         self.assertEqual(int(mask_for(self.detector, "5", pitch_black)[0, 0]), 255)
         self.assertEqual(int(mask_for(self.detector, "1", pitch_black)[0, 0]), 0)
 
-    def test_shadowed_blue_and_green_stay_chromatic(self):
-        for color_id, pixel in (("3", (118, 250, 95)), ("4", (75, 250, 95))):
+    def test_bright_colour_is_never_black(self):
+        """What actually keeps colours out of the black mask is brightness."""
+        for color_id, pixel in (("1", (5, 255, 200)), ("3", (118, 250, 180)),
+                                ("4", (75, 250, 180)), ("6", (95, 140, 200))):
             self.assertEqual(
                 int(mask_for(self.detector, "5", pixel)[0, 0]), 0,
-                "colour %s must not be swallowed by the black mask" % color_id,
-            )
-            self.assertEqual(
-                int(mask_for(self.detector, color_id, pixel)[0, 0]), 255,
-                "colour %s must survive its own mask when darkened" % color_id,
+                "colour %s at its working brightness must not be black" % color_id,
             )
 
-    def test_saturated_dark_noise_is_not_black(self):
-        """Chroma noise lifts S, so dark saturated pixels must not become black.
+    def test_shadow_darkness_overlaps_black_by_design(self):
+        """Documented trade-off: a very dark colour pixel does look like black.
 
-        Dark *neutral* pixels (low S, low V) are indistinguishable from a black
-        material by colour alone - that is what the area band is for.
+        Both a shadowed red pixel and a glossy black groove are dark and
+        saturated, so no per-pixel rule separates them. The round's distinct
+        colour assignment plus each colour's v_min are the guard, not s_max.
         """
-        saturated_noise = (100, 200, 40)
-        self.assertEqual(int(mask_for(self.detector, "5", saturated_noise)[0, 0]), 0)
+        shadowed_red = (5, 255, 60)
+        self.assertEqual(int(mask_for(self.detector, "5", shadowed_red)[0, 0]), 255)
+        self.assertEqual(int(mask_for(self.detector, "1", shadowed_red)[0, 0]), 0)
 
 
 class ValueFloorTest(unittest.TestCase):
@@ -133,7 +128,6 @@ class ShadowCannotBeShapedAwayTest(unittest.TestCase):
     def test_a_solid_round_shadow_passes_every_shape_gate(self):
         """Documents the limit: shape gates reject hollow/fragmented blobs only."""
         config = load_config()
-        config["colors"]["5"]["black_threshold"] = {"v_max": 80, "s_min": 0, "s_max": 90}
         config["scenes"]["TURNTABLE"].update({"min_area": 300, "max_area": 500000})
         detector = detector_for(config)
         frame = np.full((720, 1280, 3), 200, dtype=np.uint8)
