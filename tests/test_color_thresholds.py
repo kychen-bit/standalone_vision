@@ -48,7 +48,16 @@ class BlackIsDarkNotAchromaticTest(unittest.TestCase):
 
     def test_black_gate_only_limits_brightness(self):
         black = self.config["colors"]["5"]["black_threshold"]
-        self.assertLessEqual(black["v_max"], 120)
+        self.assertLessEqual(black["v_max"], 160)
+        # Measured: the black face's V runs p25=42 p50=88 p75=164 with the table
+        # at ~200. A gate at the median (80) leaves half the face outside, so
+        # the blob halves and its centre flickers; above ~100 the whole face is
+        # modelled and the centre is stable to a fraction of a pixel.
+        self.assertGreaterEqual(
+            black["v_max"], 100,
+            "a black v_max at the face's own median makes the blob flicker "
+            "(measured 7% area swing, 1.2 px centre jitter)",
+        )
         # Deliberate: a glossy black part reflects saturated light.
         self.assertGreaterEqual(
             black["s_max"], 200,
