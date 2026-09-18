@@ -46,34 +46,53 @@ class BlackIsDarkNotAchromaticTest(unittest.TestCase):
         self.config = load_config()
         self.detector = detector_for(self.config)
 
-    def test_black_gate_only_limits_brightness(self):
-        black = self.config["colors"]["5"]["black_threshold"]
-        self.assertLessEqual(black["v_max"], 160)
+    def test_every_colour_uses_the_same_schema(self):
+        """One schema for all six: hsv_ranges with min and max on all three.
+
+        Black is two ordinary ranges (dark + coloured-clipped), so nothing in
+        the config or the detector treats it specially any more.
+        """
+        for color_id, definition in self.config["colors"].items():
+            ranges = definition.get("hsv_ranges")
+            self.assertTrue(ranges, "colors.%s has no hsv_ranges" % color_id)
+            for entry in ranges:
+                for key in ("h_min", "h_max", "s_min", "s_max", "v_min", "v_max"):
+                    self.assertIn(key, entry, "colors.%s range %s" % (color_id, entry))
+                self.assertLessEqual(entry["h_min"], entry["h_max"])
+                self.assertLessEqual(entry["s_min"], entry["s_max"])
+                self.assertLessEqual(entry["v_min"], entry["v_max"])
+            self.assertNotIn("black_threshold", definition)
+
+    def test_black_gate_is_a_dark_range(self):
+        dark = self.config["colors"]["5"]["hsv_ranges"][0]
+        self.assertEqual((dark["h_min"], dark["h_max"]), (0, 179))
+        self.assertEqual((dark["s_min"], dark["s_max"]), (0, 255))
+        self.assertEqual(dark["v_min"], 0)
         # Measured: the black face's V runs p25=42 p50=88 p75=164 with the table
         # at ~200. A gate at the median (80) leaves half the face outside, so
         # the blob halves and its centre flickers; above ~100 the whole face is
         # modelled and the centre is stable to a fraction of a pixel.
         self.assertGreaterEqual(
-            black["v_max"], 100,
-            "a black v_max at the face's own median makes the blob flicker "
+            dark["v_max"], 100,
+            "a black gate at the face's own median makes the blob flicker "
             "(measured 7% area swing, 1.2 px centre jitter)",
         )
-        # Deliberate: a glossy black part reflects saturated light.
-        self.assertGreaterEqual(
-            black["s_max"], 200,
-            "a chroma gate on black cannot cover a glossy black part; measured "
-            "coverage drops from 47.9% to 0.4% of the face",
-        )
+        self.assertLessEqual(dark["v_max"], 160)
 
-    def test_clip_interval_sits_above_the_table(self):
+    def test_clip_range_sits_above_the_table(self):
         """The clipped interval must not swallow the table.
 
-        Measured table V p10..p90 = 139..170, so 245 leaves a wide margin; the
-        value is what makes a mirror-bright black face detectable at all.
+        Measured table V p10..p90 = 139..170, so 245 leaves a wide margin; this
+        interval is what makes a mirror-bright black face detectable at all.
         """
-        black = self.config["colors"]["5"]["black_threshold"]
-        self.assertGreaterEqual(black["v_clip_min"], 220)
-        self.assertLessEqual(black["v_clip_min"], 254)
+        clipped = self.config["colors"]["5"]["hsv_ranges"][1]
+        self.assertGreaterEqual(clipped["v_min"], 220)
+        self.assertLessEqual(clipped["v_min"], 254)
+        self.assertEqual(clipped["v_max"], 255)
+        # Saturation floor: a specular highlight keeps the lamp's colour while a
+        # blown-out *diffuse* white surface desaturates, so without it the white
+        # table would be read as black.
+        self.assertGreaterEqual(clipped["s_min"], 60)
 
     def test_dark_saturated_black_face_is_in_the_black_mask(self):
         """The measured black part: dark groove with S=220."""

@@ -89,17 +89,6 @@ def channel_excess(detector, color_id, hue, saturation, value):
     This is the actionable part of the diagnosis: it says which bound to move
     (for example ``{"V": 45}`` means "v_min is 45 too high").
     """
-    if color_id == "5":
-        black = detector.black_threshold or {}
-        excess = {}
-        over = value - float(black.get("v_max", 80))
-        if over > 0:
-            excess["V"] = round(over, 1)
-        low = float(black.get("s_min", 0)) - saturation
-        high = saturation - float(black.get("s_max", 255))
-        if max(low, high) > 0:
-            excess["S"] = round(max(low, high), 1)
-        return excess
     best = None
     for lower, upper in detector.color_ranges.get(color_id, ()):
         excess = {}

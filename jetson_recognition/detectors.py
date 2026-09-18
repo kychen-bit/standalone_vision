@@ -65,33 +65,9 @@ class TopViewDetector:
         # in a future optional detector, not in the competition path.
         self.color_ranges = {}
         self.color_names = {}
-        self.black_threshold = None
         for color_id, definition in config["colors"].items():
             color_id = str(color_id)
             self.color_names[color_id] = str(definition["name"]).upper()
-            if color_id == "5":
-                black = definition["black_threshold"]
-                self.black_threshold = {
-                    "v_max": int(black["v_max"]),
-                    "s_min": int(black.get("s_min", 0)),
-                    "s_max": int(black.get("s_max", 255)),
-                }
-                # A glossy black part has almost no diffuse component, so the
-                # top face is a mirror of the lamp: lit head-on it clips instead
-                # of going dark. Measured on the real part under the fill light:
-                # face V p10=148 p50=255 (half the face clipped) while the table
-                # sits at 142~170 - the material is *brighter* than the table, so
-                # no upper brightness limit can call it black. What still holds
-                # is that it is never mid-grey: dark (grooves, lamp angled) or
-                # clipped (lamp head-on). 0 disables the second interval.
-                self.black_clip_min = int(black.get("v_clip_min", 0))
-                # A specular reflection keeps the lamp's colour (measured face
-                # S=125) while a diffuse white surface that clips desaturates to
-                # S~0, so the clipped interval needs a saturation floor. Without
-                # it a blown-out white table would be read as black.
-                self.black_clip_s_min = int(black.get("v_clip_s_min", 0))
-                self.color_ranges[color_id] = []
-                continue
             ranges = []
             for threshold in definition.get("hsv_ranges", []):
                 lower = np.asarray(
@@ -182,6 +158,10 @@ class TopViewDetector:
         )
         if not 0.0 <= self.black_min_circularity <= 1.0:
             raise ValueError("black_min_circularity must be in [0, 1]")
+        # Colours whose hue is not meaningful (black covers the whole circle).
+        self.hue_blind_colors = {
+            str(item) for item in geometry.get("hue_blind_colors", ["5"])
+        }
         dynamic_roi = color_config.get("dynamic_roi", {})
         self.dynamic_roi_enabled = bool(dynamic_roi.get("enabled", False))
         self.dynamic_roi_margin = max(0, int(dynamic_roi.get("margin_px", 80)))
@@ -340,8 +320,9 @@ class TopViewDetector:
                     np.abs(value - prototype[2])
                     / max(self.label_value_scale, 1e-6)
                 )
-                if color_id == "5":
-                    # Hue is meaningless for a neutral-dark material.
+                if color_id in self.hue_blind_colors:
+                    # Hue carries no information for black: its ranges cover the
+                    # whole 0..179 circle, so a prototype must not add a hue term.
                     distances[color_id] = np.sqrt(ds * ds + dv * dv)
                     continue
                 dh = self._hue_delta(hue, prototype[0]) / max(
@@ -349,43 +330,19 @@ class TopViewDetector:
                 )
                 distances[color_id] = np.sqrt(dh * dh + ds * ds + dv * dv)
                 continue
-            if color_id == "5":
-                black = self.black_threshold
-                if black is None:
-                    distances[color_id] = None
-                    continue
-                dv = self._channel_distance(
-                    value, 0.0, black["v_max"],
-                    self.label_value_scale, self.label_center_weight,
-                )
-                ds = self._channel_distance(
-                    saturation, black["s_min"], black["s_max"],
-                    self.label_saturation_scale, self.label_center_weight,
-                )
-                if self.black_clip_min > 0:
-                    # Mirror-bright face: measure the value distance to the
-                    # nearer of the two intervals, otherwise a clipped black
-                    # face would score as far from black as the table does.
-                    clip_distance = self._channel_distance(
-                        value, float(self.black_clip_min), 255.0,
-                        self.label_value_scale, self.label_center_weight,
-                    )
-                    if self.black_clip_s_min > 0:
-                        # Only a *coloured* highlight counts; a desaturated one
-                        # belongs to a blown-out white surface, not to black.
-                        clip_distance = np.where(
-                            saturation >= float(self.black_clip_s_min),
-                            clip_distance, np.inf,
-                        )
-                    dv = np.minimum(dv, clip_distance)
-                distances[color_id] = np.sqrt(dv * dv + ds * ds)
-                continue
             best = None
             for lower, upper in self.color_ranges.get(color_id, ()):
-                dh = self._channel_distance(
-                    hue, lower[0], upper[0],
-                    self.label_hue_scale, self.label_center_weight,
-                )
+                if color_id in self.hue_blind_colors:
+                    # Black's hue range spans the whole circle, so a hue term
+                    # would just add a meaningless pull towards its centre
+                    # (measured: it inflated the material distance from 0.044
+                    # to 0.082 and would eventually reject real black parts).
+                    dh = 0.0
+                else:
+                    dh = self._channel_distance(
+                        hue, lower[0], upper[0],
+                        self.label_hue_scale, self.label_center_weight,
+                    )
                 ds = self._channel_distance(
                     saturation, lower[1], upper[1],
                     self.label_saturation_scale, self.label_center_weight,
@@ -968,27 +925,12 @@ class TopViewDetector:
         return [left, top, right - left, bottom - top]
 
     def _make_color_mask(self, hsv, color_id):
-        if color_id == "5":
-            black = self.black_threshold
-            mask = cv2.inRange(
-                hsv,
-                np.asarray([0, black["s_min"], 0], dtype=np.uint8),
-                np.asarray([179, black["s_max"], black["v_max"]], dtype=np.uint8),
-            )
-            if self.black_clip_min > 0:
-                # Clipped speculation counts as black too: measured on the real
-                # part, V>=245 alone gives the whole face as one blob with
-                # aspect 1.00 and hull circularity 1.00 (bbox 286x285), while the
-                # table contributes 3 px - and the S floor keeps a blown-out
-                # *white* surface (S~0) out of the black mask.
-                clipped = cv2.inRange(
-                    hsv,
-                    np.asarray([0, self.black_clip_s_min, self.black_clip_min],
-                               dtype=np.uint8),
-                    np.asarray([179, 255, 255], dtype=np.uint8),
-                )
-                cv2.bitwise_or(mask, clipped, dst=mask)
-            return mask
+        """OR of every configured HSV range of one colour.
+
+        Black is expressed as two ordinary ranges (dark, and optionally
+        coloured-clipped for a mirror-bright face), so there is no special case
+        left in this function or in _color_distances.
+        """
         mask = None
         for lower, upper in self.color_ranges[color_id]:
             part = cv2.inRange(hsv, lower, upper)
