@@ -65,6 +65,16 @@ class BlackIsDarkNotAchromaticTest(unittest.TestCase):
             "coverage drops from 47.9% to 0.4% of the face",
         )
 
+    def test_clip_interval_sits_above_the_table(self):
+        """The clipped interval must not swallow the table.
+
+        Measured table V p10..p90 = 139..170, so 245 leaves a wide margin; the
+        value is what makes a mirror-bright black face detectable at all.
+        """
+        black = self.config["colors"]["5"]["black_threshold"]
+        self.assertGreaterEqual(black["v_clip_min"], 220)
+        self.assertLessEqual(black["v_clip_min"], 254)
+
     def test_dark_saturated_black_face_is_in_the_black_mask(self):
         """The measured black part: dark groove with S=220."""
         groove = (123, 220, 30)
@@ -78,8 +88,56 @@ class BlackIsDarkNotAchromaticTest(unittest.TestCase):
         self.assertEqual(int(mask_for(self.detector, "5", pitch_black)[0, 0]), 255)
         self.assertEqual(int(mask_for(self.detector, "1", pitch_black)[0, 0]), 0)
 
-    def test_bright_colour_is_never_black(self):
-        """What actually keeps colours out of the black mask is brightness."""
+    def test_clipped_mirror_face_is_black(self):
+        """Head-on under the fill light the black face clips instead of darkening.
+
+        Measured: face V p10=148 p50=255 (half clipped) while the table is at
+        142~170, so the material is *brighter* than the table and only the
+        clipped interval separates them: V>=245 gave the whole face as one blob
+        (bbox 286x285, aspect 1.00, hull circularity 1.00) with 3 px from the
+        table.
+        """
+        face = (111, 125, 255)
+        self.assertEqual(int(mask_for(self.detector, "5", face)[0, 0]), 255)
+        # ...and it must also *score* as black, or the blob would be dropped by
+        # the material distance gate after passing the mask.
+        distances = self.detector._color_distances(
+            np.asarray([111.0], dtype=np.float32),
+            np.asarray([125.0], dtype=np.float32),
+            np.asarray([255.0], dtype=np.float32),
+            ["1", "5"],
+        )
+        self.assertLess(float(distances["5"][0]), 0.2)
+        self.assertLess(float(distances["5"][0]), float(distances["1"][0]))
+
+    def test_clipped_white_surface_is_not_black(self):
+        """The saturation floor is what keeps a blown-out white surface out.
+
+        A specular highlight keeps the lamp's colour (measured face S=125); a
+        diffuse white surface that clips desaturates to S~0. Without this floor a
+        white synthetic background enters the black mask and swallows everything.
+        """
+        for white in ((0, 0, 255), (0, 20, 250), (0, 60, 255)):
+            self.assertEqual(
+                int(mask_for(self.detector, "5", white)[0, 0]), 0,
+                "clipped white %s must not be black" % (white,),
+            )
+
+    def test_mid_grey_table_is_not_black(self):
+        """The table is the mid-grey that black must never claim."""
+        table = (139, 72, 156)
+        self.assertEqual(int(mask_for(self.detector, "5", table)[0, 0]), 0)
+
+    def test_really_bright_colour_is_black_by_design(self):
+        """A clipped *coloured* pixel is also not mid-grey.
+
+        Accepted consequence of the two-interval rule: a glossy colour's small
+        specular spots land in the black mask. They are far below min_area, and
+        a colour whose whole face is clipped is unusable anyway.
+        """
+        blown = (5, 255, 255)
+        self.assertEqual(int(mask_for(self.detector, "5", blown)[0, 0]), 255)
+        # Working brightness of the colours stays out.
         for color_id, pixel in (("1", (5, 255, 200)), ("3", (118, 250, 180)),
                                 ("4", (75, 250, 180)), ("6", (95, 140, 200))):
             self.assertEqual(

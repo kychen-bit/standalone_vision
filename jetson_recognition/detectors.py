@@ -76,6 +76,20 @@ class TopViewDetector:
                     "s_min": int(black.get("s_min", 0)),
                     "s_max": int(black.get("s_max", 255)),
                 }
+                # A glossy black part has almost no diffuse component, so the
+                # top face is a mirror of the lamp: lit head-on it clips instead
+                # of going dark. Measured on the real part under the fill light:
+                # face V p10=148 p50=255 (half the face clipped) while the table
+                # sits at 142~170 - the material is *brighter* than the table, so
+                # no upper brightness limit can call it black. What still holds
+                # is that it is never mid-grey: dark (grooves, lamp angled) or
+                # clipped (lamp head-on). 0 disables the second interval.
+                self.black_clip_min = int(black.get("v_clip_min", 0))
+                # A specular reflection keeps the lamp's colour (measured face
+                # S=125) while a diffuse white surface that clips desaturates to
+                # S~0, so the clipped interval needs a saturation floor. Without
+                # it a blown-out white table would be read as black.
+                self.black_clip_s_min = int(black.get("v_clip_s_min", 0))
                 self.color_ranges[color_id] = []
                 continue
             ranges = []
@@ -348,6 +362,22 @@ class TopViewDetector:
                     saturation, black["s_min"], black["s_max"],
                     self.label_saturation_scale, self.label_center_weight,
                 )
+                if self.black_clip_min > 0:
+                    # Mirror-bright face: measure the value distance to the
+                    # nearer of the two intervals, otherwise a clipped black
+                    # face would score as far from black as the table does.
+                    clip_distance = self._channel_distance(
+                        value, float(self.black_clip_min), 255.0,
+                        self.label_value_scale, self.label_center_weight,
+                    )
+                    if self.black_clip_s_min > 0:
+                        # Only a *coloured* highlight counts; a desaturated one
+                        # belongs to a blown-out white surface, not to black.
+                        clip_distance = np.where(
+                            saturation >= float(self.black_clip_s_min),
+                            clip_distance, np.inf,
+                        )
+                    dv = np.minimum(dv, clip_distance)
                 distances[color_id] = np.sqrt(dv * dv + ds * ds)
                 continue
             best = None
@@ -940,13 +970,25 @@ class TopViewDetector:
     def _make_color_mask(self, hsv, color_id):
         if color_id == "5":
             black = self.black_threshold
-            # TODO(real material only): add an optional local brightness check
-            # here only if fixed lighting still cannot separate black/shadow.
-            return cv2.inRange(
+            mask = cv2.inRange(
                 hsv,
                 np.asarray([0, black["s_min"], 0], dtype=np.uint8),
                 np.asarray([179, black["s_max"], black["v_max"]], dtype=np.uint8),
             )
+            if self.black_clip_min > 0:
+                # Clipped speculation counts as black too: measured on the real
+                # part, V>=245 alone gives the whole face as one blob with
+                # aspect 1.00 and hull circularity 1.00 (bbox 286x285), while the
+                # table contributes 3 px - and the S floor keeps a blown-out
+                # *white* surface (S~0) out of the black mask.
+                clipped = cv2.inRange(
+                    hsv,
+                    np.asarray([0, self.black_clip_s_min, self.black_clip_min],
+                               dtype=np.uint8),
+                    np.asarray([179, 255, 255], dtype=np.uint8),
+                )
+                cv2.bitwise_or(mask, clipped, dst=mask)
+            return mask
         mask = None
         for lower, upper in self.color_ranges[color_id]:
             part = cv2.inRange(hsv, lower, upper)
