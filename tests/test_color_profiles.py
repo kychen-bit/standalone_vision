@@ -111,7 +111,7 @@ class ApplyColorProfileTest(unittest.TestCase):
 
     def test_unknown_section_is_rejected(self):
         with self.assertRaises(ValueError):
-            save_override(self.root, "ambient", "camera", {})
+            save_override(self.root, "ambient", "geometry", {})
 
     def test_save_then_apply_round_trip(self):
         self.write_profile({"ambient": {}, "fill": {}})
@@ -129,15 +129,56 @@ class ApplyColorProfileTest(unittest.TestCase):
         self.assertEqual(sorted(stored["ambient"]["colors"]), ["3", "4"])
 
     def test_real_config_and_profile_file_load(self):
+        """The shipped file must actually drive the shipped config."""
         real_root = PROJECT_ROOT
         config = json.loads(
             (real_root / "config" / "jetson.json").read_text(encoding="utf-8")
         )
-        before = copy.deepcopy(config["colors"])
+        profile = json.loads(
+            (real_root / "config" / "color_profiles.json").read_text(encoding="utf-8")
+        )
         info = apply_color_profile(config, real_root, quiet=True)
         self.assertEqual(info["profile"], "ambient")
-        # the shipped ambient section is empty, so nothing may change yet
-        self.assertEqual(config["colors"], before)
+        section = profile["ambient"]
+        # Every colour the file mentions must end up identical to the file.
+        for color_id, block in section.get("colors", {}).items():
+            if not color_id.isdigit():
+                continue
+            self.assertEqual(
+                config["colors"][color_id]["hsv_ranges"], block["hsv_ranges"],
+                "colors.%s was not taken from the profile file" % color_id,
+            )
+        # And the mode must select its own camera profile.
+        self.assertEqual(
+            config["camera"]["v4l2_control_profile"],
+            section["camera"]["v4l2_control_profile"],
+        )
+
+    def test_each_mode_selects_its_own_camera_profile(self):
+        profile = json.loads(
+            (PROJECT_ROOT / "config" / "color_profiles.json").read_text("utf-8")
+        )
+        for name in ("fill", "ambient"):
+            self.assertIn("camera", profile[name], "%s needs a camera section" % name)
+        self.assertNotEqual(
+            profile["fill"]["camera"]["v4l2_control_profile"],
+            profile["ambient"]["camera"]["v4l2_control_profile"],
+            "the two lighting modes need different exposures",
+        )
+
+    def test_command_line_still_beats_the_profile(self):
+        """The override lands *after* the merge in every entry point."""
+        self.write_profile(
+            {"ambient": {"camera": {"v4l2_control_profile": "from_profile"}}}
+        )
+        config = base_config()
+        config["camera"] = {"v4l2_control_profile": "base"}
+        apply_color_profile(config, self.root, quiet=True)
+        self.assertEqual(config["camera"]["v4l2_control_profile"], "from_profile")
+        # An explicit choice replaces the merged value, which is what run.py and
+        # the live tool do with --camera-profile after build_engine.
+        config["camera"]["v4l2_control_profile"] = "explicit"
+        self.assertEqual(config["camera"]["v4l2_control_profile"], "explicit")
 
 
 if __name__ == "__main__":

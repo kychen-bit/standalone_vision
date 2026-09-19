@@ -336,10 +336,6 @@ def main():
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if arguments.fill_light is not None:
         config.setdefault("lighting", {})["fill_light"] = bool(arguments.fill_light)
-    if arguments.camera_profile:
-        # Must be set before build_engine: the camera is opened with this and
-        # the startup log then reports the profile that is actually applied.
-        config["camera"]["v4l2_control_profile"] = arguments.camera_profile
     # Follow the configured frame size instead of a hard-coded 1280x720 centre,
     # so a capture-mode change does not silently move the reference point.
     apply_capture_profile(config["camera"], arguments.capture_profile)
@@ -382,6 +378,10 @@ def main():
     hsv_probe = HSVProbe()
     window_name = "Turntable all-color target test"
     camera_config = dict(config["camera"])
+    if arguments.camera_profile:
+        # Applied after build_engine, so an explicit command line still beats
+        # the camera section that the active lighting profile selects.
+        camera_config["v4l2_control_profile"] = arguments.camera_profile
     if arguments.camera_backend:
         camera_config["backend"] = arguments.camera_backend
     print(

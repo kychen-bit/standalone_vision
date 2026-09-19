@@ -1,10 +1,60 @@
 {
-  "notice": "按补光模式分开的颜色参数。lighting.fill_light=true 时只用 config/jetson.json 里的 colors/color_detection（你有补光时标定的那套）；false 时把下面 ambient 节深合并覆盖上去。只写要改的键即可，不用整段复制。",
+  "notice": "按补光模式分开的相机与颜色参数。lighting.fill_light=true 时用 fill 节，false 时用 ambient 节；深合并覆盖到 config/jetson.json 的 colors / color_detection / camera 上，只写要覆盖的键即可。命令行 --fill-light / --camera-profile 仍然可以临时压过这里。",
+  "camera_notice": "camera 节的作用：切补光模式时连相机档一起换（曝光/增益/白平衡/对焦）。没有它的话两种模式共用 competition_locked，无补光时曝光太低、什么都认不到。",
   "how_to_use": {
     "切换": "config/jetson.json -> lighting.fill_light，或命令行 --fill-light / --no-fill-light",
     "只改一个色号的 V 下限": "\"ambient\": {\"colors\": {\"2\": {\"hsv_ranges\": [{\"v_min\": 120}]}}}  —— 注意 hsv_ranges 是列表，写了就会整段替换该色号的区间",
     "更推荐的做法": "无补光下不要手改区间，直接在实时工具里鼠标指物料按 1~6 采原型（不需要动掩码），原型会写进本文件的 ambient 节"
   },
-  "fill": {},
-  "ambient": {}
+  "fill": {
+    "camera": {
+      "v4l2_control_profile": "fill_light_locked"
+    }
+  },
+  "ambient": {
+    "camera": {
+      "v4l2_control_profile": "dim_room_locked"
+    },
+    "notice": "colors 里的值是【参考起点值】= 你现在的有补光值，只按无补光的方向动了两处：s_min 降 20~30（漫射光下彩度略降、且归一化后台面变中性不再是竞争者）；v_min 提到 50 左右（无补光帧整体更暗、噪声占比更高，v_min=0 会让暗彩噪进来，实测过 S=204/V=118 的彩色噪声）。色相没动：归一化会把灯光色偏去掉，色相基本可复用。黑料两条区间都留着（区间二没补光时基本用不到，留着无害，因为削顶的白台面 S≈0 进不了它）。调法：按 d 看 core_hsv / mask_hsv_median，某色号 mask_px≈0 就把 v_min 再降 10，掩码吃了背景就把 s_min 升 20，调完把实测值写回 colors。",
+    "color_detection": {
+      "illumination": {
+        "notice": "无补光模式必须开着白场归一化，且画面里要真的有一块白场（neutral_ratio >= 0.05），否则诊断会报 NO_NEUTRAL_REFERENCE 并拒绝执行。"
+      }
+    },
+    "colors": {
+
+      "1": {
+        "hsv_ranges": [
+          { "h_min": 0, "h_max": 10, "s_min": 170, "s_max": 255, "v_min": 50, "v_max": 255 },
+          { "h_min": 170, "h_max": 179, "s_min": 170, "s_max": 255, "v_min": 50, "v_max": 255 }
+        ]
+      },
+      "2": {
+        "hsv_ranges": [
+          { "h_min": 10, "h_max": 50, "s_min": 180, "s_max": 255, "v_min": 50, "v_max": 255 }
+        ]
+      },
+      "3": {
+        "hsv_ranges": [
+          { "h_min": 108, "h_max": 135, "s_min": 140, "s_max": 255, "v_min": 50, "v_max": 255 }
+        ]
+      },
+      "4": {
+        "hsv_ranges": [
+          { "h_min": 60, "h_max": 100, "s_min": 180, "s_max": 255, "v_min": 50, "v_max": 255 }
+        ]
+      },
+      "5": {
+        "hsv_ranges": [
+          { "h_min": 0, "h_max": 120, "s_min": 0, "s_max": 90, "v_min": 0, "v_max": 140 },
+          { "h_min": 0, "h_max": 179, "s_min": 80, "s_max": 255, "v_min": 245, "v_max": 255 }
+        ]
+      },
+      "6": {
+        "hsv_ranges": [
+          { "h_min": 100, "h_max": 120, "s_min": 120, "s_max": 255, "v_min": 45, "v_max": 255 }
+        ]
+      }
+    }
+  }
 }

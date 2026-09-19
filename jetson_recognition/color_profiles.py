@@ -21,7 +21,11 @@ from pathlib import Path
 import time
 
 PROFILE_FILE = "config/color_profiles.json"
-PROFILE_SECTIONS = ("colors", "color_detection")
+# ``camera`` lets each lighting mode pick its own v4l2_control_profile, so
+# switching fill_light also switches exposure/gain instead of relying on the
+# operator to remember --camera-profile. A command line override still wins,
+# because every entry point applies it after this merge.
+PROFILE_SECTIONS = ("colors", "color_detection", "camera")
 
 
 def _deep_merge(base, override):
@@ -54,7 +58,9 @@ def apply_color_profile(config, project_root, override=None, quiet=False):
     """Merge the active profile over the colour parameters in place.
 
     Idempotent: the override only ever adds or replaces keys, so calling this
-    from both the engine builder and a tool is harmless.
+    from both the engine builder and a tool is harmless. Keys starting with an
+    underscore inside a ``colors`` block are documentation: merging them would
+    put a string where the detector expects a colour definition.
     """
     name = resolve_profile_name(config, override)
     info = {
@@ -77,7 +83,13 @@ def apply_color_profile(config, project_root, override=None, quiet=False):
             continue
         target = config.setdefault(section, {})
         if section == "colors":
-            info["colors_overridden"] = sorted(block)
+            block = {
+                key: value for key, value in block.items()
+                if not str(key).startswith("_")
+            }
+            if not block:
+                continue
+            info["colors_overridden"] = sorted(block, key=str)
         _deep_merge(target, block)
         info["sections"].append(section)
     if not quiet:
