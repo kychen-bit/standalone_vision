@@ -134,6 +134,17 @@ jetson_cmd_done = 1;
 C 板发送 `DONE,<seq>,OK`，收到 `DONE_ACK,<seq>,OK` 后回到
 `JETSON_PH_TASK_READY`。若要模拟动作失败，将 `jetson_cmd_done` 设为 `2`。
 
+若不确定当前观察位上是哪种颜色，用转盘巡检（协议 3.7）：
+
+```text
+C 板发送 REQ,<seq>,CLASSIFY,TURNTABLE,<本轮3色>
+Jetson 回复 ACCEPTED，随后 ALIGN_READY,<seq>,CLASSIFY,<实际颜色>,<x>,<y>,0.000,<unit>,<confidence>,<stable>
+```
+
+第 3 字段就是实际识别到的颜色号；同样不发 `EXEC`，用完设 `jetson_cmd_done = 1`。
+决定要抓之后再发 `REQ,<seq>,PICK,TURNTABLE,<该颜色>` 走正常抓取流程。
+观察位里什么都没有时不会回帧，等到 `TIMEOUT`（当前 `timeout_s`），电控应把它当成"没看到物料"。
+
 ## 5. 阶段四：手动验证 PLACE
 
 在圆环区测试画面准备好后设置：
