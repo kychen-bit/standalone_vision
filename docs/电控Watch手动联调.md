@@ -155,6 +155,10 @@ PLACE 没有 EXEC。收到 ALIGN_READY 后模拟放置完成：
 jetson_cmd_done = 1;
 ```
 
+同一个圆环区还要做**车体纠偏**时用 `REQ,<seq>,LOCATE,ROUGH`（协议 3.6）：回复同样是
+`ALIGN_READY`，但 `kind=LOCATE`、目标位是锚点环号（默认 `2`），同样不发 `EXEC`；电控按
+`x/y` 把车开到目标位置后再设 `jetson_cmd_done = 1`。注意 `unit=PX` 时这个偏移不能用于车体定位。
+
 收到 DONE_ACK 后应回到 `JETSON_PH_TASK_READY`。
 
 ## 6. 阶段五：手动验证 STACK

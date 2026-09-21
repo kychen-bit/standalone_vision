@@ -5,7 +5,7 @@ Navigation, obstacle avoidance and gripper motion belong to the electronics
 communication glue:
 
 - receives the task code from MaixCAM Pro (TCP or UART, ``@MAIX_QR`` frames);
-- answers MCU requests (``REQ PICK / PLACE / STACK``) with recognition;
+- answers MCU requests (``REQ PICK / PLACE / STACK / LOCATE``) with recognition;
 - emits ``GRASP_READY`` / ``ALIGN_READY`` with coordinates after the simple
   recognition session becomes stable; navigation and motion remain MCU-owned;
 - advances the auto pickup queue after ``DONE OK``;
@@ -178,6 +178,18 @@ class VisionCoordinator:
             self.ring = fields[4] if len(fields) > 4 else "1"
             mode = "STACK"
             mode_args = (target, zone, self.ring)
+        elif kind == "LOCATE":
+            # Car-body correction in the ring areas: report where the anchor
+            # ring is so the MCU can turn it into the car's offset. The scene
+            # must be explicit because the ring scenes are not the default
+            # TURNTABLE, and the ring defaults to 2 (the slot the car stops in
+            # front of).
+            if len(fields) < 3:
+                self._error(seq, "MISSING_SCENE")
+                return
+            target = fields[3] if len(fields) > 3 else "2"
+            mode = "RING"
+            mode_args = (target, zone)
         else:
             self._error(seq, "BAD_KIND")
             return
@@ -271,7 +283,7 @@ class VisionCoordinator:
         self.last_count = 0
         if self.kind == "PICK":
             self.session = self.engine.new_session("COLOR", (self.target, self.zone))
-        elif self.kind == "PLACE":
+        elif self.kind in ("PLACE", "LOCATE"):
             self.session = self.engine.new_session("RING", (self.target, self.zone))
         elif self.kind == "STACK":
             self.session = self.engine.new_session(

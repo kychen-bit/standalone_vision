@@ -310,6 +310,44 @@ class CoordinatorTests(unittest.TestCase):
         encode_frame(frames[0][0], *frames[0][1])
         self.assertEqual(coordinator.state, "WAIT_DONE")
 
+    def test_locate_reports_the_anchor_ring_for_the_car(self):
+        rings = [
+            measurement(100, 100, kind="RING", target="2") for _ in range(8)
+        ]
+        _, _, coordinator = fresh_coordinator({("RING", "2"): rings})
+        start_with_task(coordinator)
+        coordinator.on_mcu_frame("REQ", ["007", "LOCATE", "ROUGH"])
+        self.assertEqual(coordinator.drain(), [("ACCEPTED", ["007", "LOCATE"])])
+        fields = feed_frames(coordinator)[0][1]
+        self.assertEqual(fields[0:3], ["007", "LOCATE", "2"])
+        # The offset only: no rotation is reported for car correction.
+        self.assertEqual(fields[5], "0.000")
+        self.assertEqual(coordinator.state, "WAIT_DONE")
+        coordinator.on_mcu_frame("DONE", ["007", "OK"])
+        self.assertEqual(coordinator.drain(), [("DONE_ACK", ["007", "OK"])])
+        self.assertEqual(coordinator.state, "TASK_READY")
+
+    def test_locate_can_name_another_anchor_ring(self):
+        rings = [
+            measurement(100, 100, kind="RING", target="3") for _ in range(8)
+        ]
+        _, _, coordinator = fresh_coordinator({("RING", "3"): rings})
+        start_with_task(coordinator)
+        coordinator.on_mcu_frame("REQ", ["008", "LOCATE", "STORAGE", "3"])
+        coordinator.drain()
+        self.assertEqual(feed_frames(coordinator)[0][1][1:3], ["LOCATE", "3"])
+
+    def test_locate_without_a_scene_is_rejected(self):
+        _, _, coordinator = fresh_coordinator()
+        coordinator.on_mcu_frame("START", ["RUN001"])
+        coordinator.accept_task_code(TASK)
+        coordinator.drain()
+        coordinator.on_mcu_frame("REQ", ["009", "LOCATE"])
+        self.assertEqual(
+            coordinator.drain(), [("ERROR", ["009", "MISSING_SCENE"])]
+        )
+        self.assertEqual(coordinator.state, "TASK_READY")
+
     def test_abort_resets_and_acknowledges(self):
         _, _, coordinator = fresh_coordinator()
         start_with_task(coordinator)
