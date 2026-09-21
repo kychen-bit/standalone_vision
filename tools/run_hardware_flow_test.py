@@ -28,6 +28,19 @@ from jetson_recognition.task_code import COLOR_NAMES, decode_task_code
 from tools.configure_maix_network import ensure_maix_network
 
 
+# ``full`` runs the whole two-batch flow; every other value runs exactly one
+# action so a single stage can be brought up on real hardware first.
+STAGES = (
+    "full",
+    "pick",
+    "place",
+    "pick-back",
+    "stack",
+    "classify",
+    "locate",
+)
+
+
 def arguments_parser():
     parser = argparse.ArgumentParser(
         description=(
@@ -56,6 +69,26 @@ def arguments_parser():
         "--skip-network-config",
         action="store_true",
         help="do not detect the Maix USB NIC or activate its static profile",
+    )
+    parser.add_argument(
+        "--stage",
+        choices=STAGES,
+        default="full",
+        help="run one action only (single-stage bring-up) instead of full",
+    )
+    parser.add_argument("--color", help="colour id for the pick/stack stages")
+    parser.add_argument("--ring", help="ring id for the place/locate stages")
+    parser.add_argument(
+        "--batch",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="which batch's colours and ring ids the single stage uses",
+    )
+    parser.add_argument(
+        "--task-code",
+        help="inject this task code over the Maix TCP channel instead of "
+        "waiting for a real QR (single-stage tests without MaixCAM)",
     )
     return parser
 
@@ -117,6 +150,34 @@ def pause(message, automatic):
     print("\n[ACTION] %s" % message, flush=True)
     if not automatic:
         input("准备好后按 Enter：")
+
+
+def inject_task_code(host, port, task_code, timeout_s=5.0):
+    """Send one ``MAIX_QR`` frame to the coordinator's TCP listener.
+
+    Single-stage tests should not need the MaixCAM board: the frame is the
+    same one the Maix sends, only the peer differs.  The coordinator accepts
+    a single client, so do not run the real Maix at the same time.
+    """
+    import socket
+
+    target = "127.0.0.1" if host in ("0.0.0.0", "::", "", None) else host
+    wire = encode_frame("MAIX_QR", task_code)
+    deadline = time.monotonic() + float(timeout_s)
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(
+                (target, int(port)), timeout=1.0
+            ) as sock:
+                sock.sendall(wire)
+            return
+        except OSError as error:
+            last_error = error
+            time.sleep(0.2)
+    raise RuntimeError(
+        "cannot inject the task code on %s:%s: %s" % (target, port, last_error)
+    )
 
 
 def start_coordinator_session(mcu, process, timeout_s=30.0):
@@ -204,17 +265,25 @@ def main():
         # serial initialization, so retry this idempotent startup handshake.
         start_coordinator_session(mcu, process)
 
-        pause(
-            "在 MaixVision 运行 maixcam_pro/main.py，并展示任务二维码",
-            args.auto,
-        )
-        if not args.skip_network_config:
-            ensure_maix_network(required=True)
-        print(
-            "[TEST] waiting for MAIX_QR/TASK_PLAN (%.0f s); Maix should show "
-            "TCP_CONNECTED and QR_SENT" % args.timeout,
-            flush=True,
-        )
+        if args.task_code:
+            print(
+                "[TEST] injecting task code %s over the Maix TCP channel"
+                % args.task_code,
+                flush=True,
+            )
+            inject_task_code(host, port, args.task_code)
+        else:
+            pause(
+                "在 MaixVision 运行 maixcam_pro/main.py，并展示任务二维码",
+                args.auto,
+            )
+            if not args.skip_network_config:
+                ensure_maix_network(required=True)
+            print(
+                "[TEST] waiting for MAIX_QR/TASK_PLAN (%.0f s); Maix should show "
+                "TCP_CONNECTED and QR_SENT" % args.timeout,
+                flush=True,
+            )
         _name, task_fields = mcu.wait_for(("TASK_PLAN",), args.timeout)
         task_code = task_fields[0]
         task = decode_task_code(task_code)
@@ -299,6 +368,104 @@ def main():
             completed.append(
                 (seq, "STACK", "STORAGE", color_id, storage_ring_id)
             )
+
+        def perform_alignment(seq, kind, scene, target, stage, extra=()):
+            """PLACE/STACK/LOCATE/CLASSIFY share this frame sequence."""
+            mcu.send("REQ", seq, kind, scene, target, *extra)
+            mcu.wait_for(("ACCEPTED",), 5.0)
+            _name, alignment = mcu.wait_for(("ALIGN_READY",), args.timeout)
+            if alignment[1] != kind:
+                raise RuntimeError("%s returned kind %s" % (stage, alignment))
+            mcu.send("DONE", seq, "OK")
+            mcu.wait_for(("DONE_ACK",), 5.0)
+            completed.append((seq, kind, scene, target))
+            return alignment
+
+        def perform_locate(seq, scene, ring_id, stage):
+            alignment = perform_alignment(seq, "LOCATE", scene, ring_id, stage)
+            if alignment[2] != ring_id:
+                raise RuntimeError(
+                    "LOCATE returned ring %s, expected %s"
+                    % (alignment[2], ring_id)
+                )
+            print(
+                "[LOCATE] 锚点环 %s 偏移 x=%s y=%s unit=%s"
+                % (alignment[2], alignment[3], alignment[4], alignment[6]),
+                flush=True,
+            )
+            return alignment
+
+        def perform_classify(seq, scene, batch, stage):
+            candidates = [item["color_id"] for item in batch]
+            pause(
+                "%s：把本轮任一物料放到 %s 观察位" % (stage, scene),
+                args.auto,
+            )
+            alignment = perform_alignment(
+                seq, "CLASSIFY", scene, candidates[0], stage,
+                extra=candidates[1:],
+            )
+            if alignment[2] not in candidates:
+                raise RuntimeError(
+                    "CLASSIFY returned %s, outside %s"
+                    % (alignment[2], candidates)
+                )
+            print(
+                "[CLASSIFY] 实际颜色 %s（本轮候选 %s）"
+                % (alignment[2], candidates),
+                flush=True,
+            )
+            return alignment
+
+        if args.stage != "full":
+            batch = first_batch if int(args.batch) == 1 else second_batch
+            color_id = str(args.color) if args.color else batch[0]["color_id"]
+            ring_id = str(args.ring) if args.ring else "1"
+            stage_label = "单环节 %s" % args.stage
+            if args.stage == "pick":
+                perform_pick(
+                    "S_PICK", {"color_id": color_id},
+                    args.color_scene.upper(), False, stage_label,
+                )
+            elif args.stage == "pick-back":
+                perform_pick(
+                    "S_PICK_BACK", {"color_id": color_id},
+                    args.ring_scene.upper(), False, stage_label,
+                )
+            elif args.stage == "place":
+                perform_place(
+                    "S_PLACE", {"ring_id": ring_id},
+                    args.ring_scene.upper(), stage_label,
+                )
+            elif args.stage == "stack":
+                perform_stack(
+                    "S_STACK", {"color_id": color_id},
+                    storage_ring_by_color.get(color_id, ring_id), stage_label,
+                )
+            elif args.stage == "classify":
+                perform_classify(
+                    "S_CLASSIFY", args.color_scene.upper(), batch, stage_label
+                )
+            elif args.stage == "locate":
+                perform_locate(
+                    "S_LOCATE", args.ring_scene.upper(),
+                    str(args.ring) if args.ring else "2", stage_label,
+                )
+            print(
+                json.dumps(
+                    {
+                        "state": "SINGLE_STAGE_OK",
+                        "stage": args.stage,
+                        "color": color_id,
+                        "ring": ring_id,
+                        "vision_actions": len(completed),
+                        "task_code": task_code,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 0
 
         # 第一批：原料区抓三件，再依次放粗加工区、从粗加工区取回、
         # 最后平放到暂存区。
