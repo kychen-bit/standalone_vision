@@ -198,6 +198,23 @@ jetson_cmd_abort = 1;
 收到 ABORTED 后 `jetson.phase` 回到 `JETSON_PH_IDLE`。重新测试必须再次设置
 `jetson_cmd_start=1`，收到 READY 后重新展示二维码。
 
+## 8. 单环节模式（逐个动作）
+
+正式流程之前，建议 C 板也支持"一个变量触发一个动作"：帧序列与正式流程完全相同，只是不依赖
+任务码里的顺序。视觉侧对应的真机脚本看 [整机闭环测试](整机闭环测试.md) 的"单环节实机联调"一节。
+
+| 单环节 | C 板变量 | C 板发送 | 收到什么算通过 |
+|---|---|---|---|
+| 物料识别抓取 | `jetson_cmd_demo_pick = 1` | `REQ,<seq>,PICK,TURNTABLE,<color>` | `GRASP_READY` → `EXEC` → `EXEC_ACK` → `DONE` |
+| 车舱取料放入圆环 | `jetson_cmd_demo_place = 1` | `REQ,<seq>,PLACE,ROUGH,<ring>` | `ALIGN_READY`（第 3 字段=环号）→ `DONE` |
+| 圆环区取回 | 同上，`scene=ROUGH` | `REQ,<seq>,PICK,ROUGH,<color>` | 同 PICK |
+| 暂存区码垛 | `jetson_cmd_demo_stack = 1` | `REQ,<seq>,STACK,STORAGE,<color>,<ring>` | `ALIGN_READY`（第 3 字段=颜色）→ `DONE` |
+| 转盘巡检 | `jetson_cmd_demo_classify = 1` ★新增 | `REQ,<seq>,CLASSIFY,TURNTABLE,<c1>,<c2>,<c3>` | `ALIGN_READY` 第 3 字段=实际颜色；没看到物料时接受 `TIMEOUT` |
+| 圆环区纠偏 | `jetson_cmd_demo_locate = 1` ★新增 | `REQ,<seq>,LOCATE,ROUGH,2` | `ALIGN_READY` 第 3 字段=锚点环号 |
+
+标 ★ 的两个变量是本次新增建议，按前四个的风格实现即可。四个 `ALIGN_READY` 类环节都不发
+`EXEC`，电控用完结果后统一设 `jetson_cmd_done = 1`。
+
 ## 8. 坐标偏差与当前能力
 
 当前 [calibration.json](../config/calibration.json) 的三个作业平面均为
