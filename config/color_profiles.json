@@ -36,23 +36,22 @@
       },
       "3": {
         "hsv_ranges": [
-          { "h_min": 108, "h_max": 135, "s_min": 140, "s_max": 255, "v_min": 50, "v_max": 255 }
+          { "h_min": 108, "h_max": 140, "s_min": 110, "s_max": 255, "v_min": 50, "v_max": 255 }
         ]
       },
       "4": {
         "hsv_ranges": [
-          { "h_min": 60, "h_max": 100, "s_min": 180, "s_max": 255, "v_min": 50, "v_max": 255 }
+          { "h_min": 40, "h_max": 100, "s_min": 140, "s_max": 255, "v_min": 50, "v_max": 150 }
         ]
       },
-      "5": {
-        "hsv_ranges": [
-          { "h_min": 0, "h_max": 120, "s_min": 0, "s_max": 90, "v_min": 0, "v_max": 140 },
-          { "h_min": 0, "h_max": 179, "s_min": 80, "s_max": 255, "v_min": 245, "v_max": 255 }
-        ]
-      },
+      "5": { "hsv_ranges": [
+         { "h_min": 0, "h_max": 179, "s_min": 0, "s_max": 10, "v_min": 0, "v_max": 130 },
+         { "h_min": 0, "h_max": 179, "s_min": 140, "s_max": 255, "v_min": 0, "v_max": 130 }
+        ] 
+    },
       "6": {
         "hsv_ranges": [
-          { "h_min": 100, "h_max": 120, "s_min": 120, "s_max": 255, "v_min": 45, "v_max": 255 }
+          { "h_min": 100, "h_max": 120, "s_min": 50, "s_max": 255, "v_min": 45, "v_max": 255 }
         ]
       }
     }
