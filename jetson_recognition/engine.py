@@ -10,6 +10,7 @@ MODE_ARGUMENTS = {
     "COLOR": 2,
     "RING": 2,
     "STACK": 3,
+    "ANY_COLOR": 2,
     "STATION": 1,
     "TURNTABLE": 1,
 }
@@ -52,6 +53,10 @@ class RecognitionEngine:
             return self.detector.detect_ring(frame, args[0], args[1])
         if mode == "STACK":
             return self.detector.detect_stack(frame, args[0], args[1], args[2])
+        if mode == "ANY_COLOR":
+            # Turntable inspection: an empty candidate list means "any colour".
+            allowed = [value for value in args[1].split(",") if value]
+            return self.detector.detect_any_color(frame, args[0], allowed or None)
         if mode == "STATION":
             return self.detector.detect_station(frame, args[0])
         return self.detector.detect_turntable(frame, args[0])

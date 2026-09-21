@@ -160,7 +160,8 @@
     "enabled_modes": [
       "COLOR",
       "RING",
-      "STACK"
+      "STACK",
+      "ANY_COLOR"
     ],
     "opencv_threads": 4,
     "stable_frames": 8,

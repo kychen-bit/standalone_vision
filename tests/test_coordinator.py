@@ -69,6 +69,9 @@ class FakeDetector:
     def detect_stack(self, frame, color_id, scene, ring_id):
         return self._next(("STACK", str(color_id)))
 
+    def detect_any_color(self, frame, scene, allowed_ids=None):
+        return self._next(("ANY_COLOR", ",".join(allowed_ids or ())))
+
 
 def fresh_coordinator(sequences=None, overrides=None):
     detector = FakeDetector(sequences or {})
@@ -309,6 +312,39 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(frames[0][1][-2:], ["0.900", "5"])
         encode_frame(frames[0][0], *frames[0][1])
         self.assertEqual(coordinator.state, "WAIT_DONE")
+
+    def test_classify_reports_the_colour_actually_in_view(self):
+        seen = [
+            measurement(100, 100, kind="COLOR", target="4") for _ in range(8)
+        ]
+        _, _, coordinator = fresh_coordinator({("ANY_COLOR", "2,3,4"): seen})
+        start_with_task(coordinator)
+        coordinator.on_mcu_frame(
+            "REQ", ["020", "CLASSIFY", "TURNTABLE", "2", "3", "4"]
+        )
+        self.assertEqual(
+            coordinator.drain(), [("ACCEPTED", ["020", "CLASSIFY"])]
+        )
+        fields = feed_frames(coordinator)[0][1]
+        # The reply carries the observed colour, never the candidate list.
+        self.assertEqual(fields[0:3], ["020", "CLASSIFY", "4"])
+        encode_frame("ALIGN_READY", *fields)
+        coordinator.on_mcu_frame("DONE", ["020", "OK"])
+        self.assertEqual(coordinator.drain(), [("DONE_ACK", ["020", "OK"])])
+        self.assertEqual(coordinator.state, "TASK_READY")
+
+    def test_classify_without_candidates_accepts_any_colour(self):
+        seen = [
+            measurement(100, 100, kind="COLOR", target="5") for _ in range(8)
+        ]
+        _, _, coordinator = fresh_coordinator({("ANY_COLOR", ""): seen})
+        start_with_task(coordinator)
+        coordinator.on_mcu_frame("REQ", ["021", "CLASSIFY"])
+        coordinator.drain()
+        self.assertEqual(coordinator.target, "ANY")
+        self.assertEqual(
+            feed_frames(coordinator)[0][1][1:3], ["CLASSIFY", "5"]
+        )
 
     def test_locate_reports_the_anchor_ring_for_the_car(self):
         rings = [

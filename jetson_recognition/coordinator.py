@@ -5,7 +5,7 @@ Navigation, obstacle avoidance and gripper motion belong to the electronics
 communication glue:
 
 - receives the task code from MaixCAM Pro (TCP or UART, ``@MAIX_QR`` frames);
-- answers MCU requests (``REQ PICK / PLACE / STACK / LOCATE``) with recognition;
+- answers MCU requests (``REQ PICK / PLACE / STACK / LOCATE / CLASSIFY``) with recognition;
 - emits ``GRASP_READY`` / ``ALIGN_READY`` with coordinates after the simple
   recognition session becomes stable; navigation and motion remain MCU-owned;
 - advances the auto pickup queue after ``DONE OK``;
@@ -59,6 +59,9 @@ class VisionCoordinator:
         self.last_state = None
         self.report_counter = 0
         self.target_from_queue = False
+        # CLASSIFY answers "which colour is in view", so it carries a candidate
+        # list instead of a single target colour.
+        self.color_candidates = ""
         self.grant_deadline = None
         self.grant_misses = 0
         # Latest per-frame result is retained only for the optional coordinator
@@ -190,6 +193,17 @@ class VisionCoordinator:
             target = fields[3] if len(fields) > 3 else "2"
             mode = "RING"
             mode_args = (target, zone)
+        elif kind == "CLASSIFY":
+            # Turntable inspection: report which colour is actually in view so
+            # the MCU can decide grasp / probe the next slot / wait for the
+            # turntable. Optional trailing fields restrict the candidates to
+            # this round's three colours.
+            self.color_candidates = ",".join(
+                str(value) for value in fields[3:]
+            )
+            target = "ANY"
+            mode = "ANY_COLOR"
+            mode_args = (zone, self.color_candidates)
         else:
             self._error(seq, "BAD_KIND")
             return
@@ -285,6 +299,10 @@ class VisionCoordinator:
             self.session = self.engine.new_session("COLOR", (self.target, self.zone))
         elif self.kind in ("PLACE", "LOCATE"):
             self.session = self.engine.new_session("RING", (self.target, self.zone))
+        elif self.kind == "CLASSIFY":
+            self.session = self.engine.new_session(
+                "ANY_COLOR", (self.zone, self.color_candidates)
+            )
         elif self.kind == "STACK":
             self.session = self.engine.new_session(
                 "STACK", (self.target, self.zone, self.ring)
@@ -433,7 +451,7 @@ class VisionCoordinator:
             "ALIGN_READY",
             self.seq,
             self.kind,
-            self.target,
+            (measurement.target_id if self.kind == "CLASSIFY" else self.target),
             "%.3f" % stable_x,
             "%.3f" % stable_y,
             "%.3f" % stable_yaw,
