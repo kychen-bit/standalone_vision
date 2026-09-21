@@ -3,7 +3,16 @@
   "dist_coeffs": null,
   "image_size": [1280, 720],
   "planes": {
-    "TURNTABLE": {"calibrated": false, "homography_px_to_robot_mm": null, "rmse_mm": null},
+    "TURNTABLE": {
+      "calibrated": true,
+      "homography_px_to_robot_mm": [
+        [0.07326, 0.0, -46.718],
+        [0.0, 0.07326, -26.146],
+        [0.0, 0.0, 1.0]
+      ],
+      "rmse_mm": null,
+      "notice": "物料顶面平面 2026-09-20 标定: k=0.07326 mm/px (顶面 phi30 = 409.5 px; 镜头到顶面 67 mm, 到转盘面 127 mm). 原点 (637.7, 356.8) = 夹爪对准位. 输出 x_mm=(x_px-637.7)*k, y_mm=(y_px-356.8)*k, 方向同图像 (x 右, y 下). 只在此高度成立: 改相机高度/对焦/换料高后必须重标."
+    },
     "ROUGH": {"calibrated": false, "homography_px_to_robot_mm": null, "rmse_mm": null},
     "STORAGE": {"calibrated": false, "homography_px_to_robot_mm": null, "rmse_mm": null}
   }
